@@ -9,29 +9,9 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal, Self
 
+from nemo_helix_plugin.intake.types import SpanKind as SpanKind
+from nemo_helix_plugin.intake.types import SpanStatus as SpanStatus
 from pydantic import BaseModel, Field, model_validator
-
-NEMO_STEP_ID_ATTRIBUTE = "nemo.step_id"
-
-
-class SpanKind(StrEnum):
-    LLM = "LLM"
-    CHAIN = "CHAIN"
-    TOOL = "TOOL"
-    RETRIEVER = "RETRIEVER"
-    EMBEDDING = "EMBEDDING"
-    AGENT = "AGENT"
-    RERANKER = "RERANKER"
-    EVALUATOR = "EVALUATOR"
-    GUARDRAIL = "GUARDRAIL"
-    UNKNOWN = "UNKNOWN"
-
-
-class SpanStatus(StrEnum):
-    SUCCESS = "success"
-    ERROR = "error"
-    CANCELLED = "cancelled"
-    UNKNOWN = "unknown"
 
 
 class SpanAttributeFilter(BaseModel):

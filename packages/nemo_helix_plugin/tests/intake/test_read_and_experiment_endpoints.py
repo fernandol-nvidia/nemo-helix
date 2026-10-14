@@ -31,6 +31,8 @@ from nemo_helix_plugin.intake.types import (
     Session,
     Span,
     SpanGroup,
+    SpanKind,
+    SpanStatus,
     Trace,
     TraceMetrics,
 )
@@ -101,6 +103,53 @@ def test_span_endpoint_shapes() -> None:
     assert single.path_template == "/apis/intake/v2/workspaces/{workspace}/spans/{span_id}"
     assert single.path_params == {"workspace": "team-a", "span_id": "span-1"}
     assert single.response_type is Span
+
+
+def _span_json(span_id: str, kind: str, status: str) -> dict[str, object]:
+    return {
+        "span_id": span_id,
+        "session_id": "s",
+        "workspace": "team-a",
+        "kind": kind,
+        "source": "atif",
+        "started_at": "2026-08-14T00:00:00Z",
+        "ingested_at": "2026-08-14T00:00:00Z",
+        "status": status,
+    }
+
+
+def test_read_models_map_values_this_sdk_does_not_know_to_unknown() -> None:
+    session_json = {
+        "id": "s",
+        "workspace": "team-a",
+        "started_at": "2026-08-14T00:00:00Z",
+        "status": "paused",
+        "trace_count": 1,
+        "span_count": 2,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"{WS}/sessions/s":
+            return httpx.Response(200, request=request, json=session_json)
+        pagination = {"page": 1, "page_size": 10, "current_page_size": 2, "total_pages": 1, "total_results": 2}
+        spans = [_span_json("a", "TOOL", "error"), _span_json("b", "MEMORY", "paused")]
+        return httpx.Response(200, request=request, json={"data": spans, "pagination": pagination})
+
+    client = _client(handler)
+    known, unknown = client.list_spans().page().items
+    session = client.get_session(id="s").data()
+
+    assert (known.kind, known.status) == (SpanKind.TOOL, SpanStatus.ERROR)
+    assert (unknown.kind, unknown.status) == (SpanKind.UNKNOWN, SpanStatus.UNKNOWN)
+    assert session.status == SpanStatus.UNKNOWN
+
+
+@pytest.mark.parametrize("invalid", [{"kind": "AGNET"}, {"status": "failed"}])
+def test_direct_span_input_accepts_only_known_kinds_and_statuses(invalid: dict[str, str]) -> None:
+    with pytest.raises(ValidationError):
+        DirectSpanInput.model_validate(
+            {"span_id": "s1", "trace_id": "t1", "started_at": "2026-08-14T00:00:00Z", **invalid}
+        )
 
 
 def test_get_session_endpoint_shape() -> None:

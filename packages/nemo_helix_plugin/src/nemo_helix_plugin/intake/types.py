@@ -6,23 +6,93 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Annotated, Any, Literal, NotRequired, Required, TypedDict
 
 from nemo_helix_plugin.schema import Page
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, RootModel, TypeAdapter, model_validator, with_config
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    JsonValue,
+    RootModel,
+    TypeAdapter,
+    model_validator,
+    with_config,
+)
 
 EvaluatorResultDataType = Literal["NUMERIC", "BOOLEAN", "CATEGORICAL", "TEXT"]
 EvaluatorResultStatus = Literal["SCORED", "FAILED"]
 TraceMode = Literal["summary", "preview", "detailed"]
 TraceStatus = Literal["OK", "ERROR", "UNSET"] | str
 SpanMode = Literal["summary", "preview", "detailed"]
-# The server's SpanKind / SpanStatus enums; direct span ingest is validated against them.
-SpanKind = (
-    Literal["LLM", "CHAIN", "TOOL", "RETRIEVER", "EMBEDDING", "AGENT", "RERANKER", "EVALUATOR", "GUARDRAIL", "UNKNOWN"]
-    | str
-)
 
-SpanStatus = Literal["success", "error", "cancelled", "unknown"] | str
+
+# Span kinds and statuses Intake stores. Request models accept only these. Response models map a value this
+# SDK does not know to UNKNOWN, as the server does on read, so a client keeps parsing when the server adds one.
+class SpanKind(StrEnum):
+    LLM = "LLM"
+    CHAIN = "CHAIN"
+    TOOL = "TOOL"
+    RETRIEVER = "RETRIEVER"
+    EMBEDDING = "EMBEDDING"
+    AGENT = "AGENT"
+    RERANKER = "RERANKER"
+    EVALUATOR = "EVALUATOR"
+    GUARDRAIL = "GUARDRAIL"
+    UNKNOWN = "UNKNOWN"
+
+
+class SpanStatus(StrEnum):
+    SUCCESS = "success"
+    ERROR = "error"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+
+def _unknown_if_unrecognized(fallback: StrEnum) -> BeforeValidator:
+    def parse(value: Any) -> StrEnum:
+        try:
+            return type(fallback)(value)
+        except ValueError:
+            return fallback
+
+    return BeforeValidator(parse)
+
+
+ResponseSpanKind = Annotated[SpanKind, _unknown_if_unrecognized(SpanKind.UNKNOWN)]
+ResponseSpanStatus = Annotated[SpanStatus, _unknown_if_unrecognized(SpanStatus.UNKNOWN)]
+
+
+class SpanAttributeKey(StrEnum):
+    """Span attribute keys Intake reads from ingested spans: each semantic field's preferred source key."""
+
+    MODEL = "gen_ai.request.model"
+    PROVIDER = "gen_ai.system"
+    PROMPT_ID = "gen_ai.prompt.id"
+    AGENT_ID = "gen_ai.agent.id"
+    AGENT_NAME = "gen_ai.agent.name"
+    AGENT_VERSION = "gen_ai.agent.version"
+    TOOL_NAME = "gen_ai.tool.name"
+    PROJECT = "gen_ai.project"
+    EVALUATION_NAME = "nemo.evaluation.name"
+    TEST_CASE_NAME = "nemo.test_case.name"
+    ERROR_TYPE = "exception.type"
+    ERROR_MESSAGE = "exception.message"
+    INPUT_TOKENS = "gen_ai.usage.input_tokens"
+    OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
+    CACHED_TOKENS = "gen_ai.usage.cached_tokens"
+    TOTAL_TOKENS = "gen_ai.usage.total_tokens"
+    PROMPT_CACHE_WRITE_TOKENS = "llm.token_count.prompt_details.cache_write"
+    PROMPT_AUDIO_TOKENS = "llm.token_count.prompt_details.audio"
+    COMPLETION_REASONING_TOKENS = "llm.token_count.completion_details.reasoning"
+    COMPLETION_AUDIO_TOKENS = "llm.token_count.completion_details.audio"
+    COST_TOTAL_USD = "gen_ai.usage.cost"
+    COST_INPUT_USD = "llm.cost.prompt"
+    COST_OUTPUT_USD = "llm.cost.completion"
+    # Orders spans that share a start time; Intake keeps it in the number bag.
+    STEP_ID = "nemo.step_id"
 
 
 @with_config(ConfigDict(extra="allow"))
@@ -289,12 +359,47 @@ class ExperimentResponse(BaseModel):
 
 
 class EvaluationContext(BaseModel):
-    """Evaluation context hydrated on trace and span responses."""
+    """Identifies the Evaluation and optional test case associated with ingested telemetry."""
 
-    evaluation_name: str | None = None
-    test_case_name: str | None = None
-    evaluation_id: str | None = None
-    test_case_id: str | None = None
+    evaluation_name: str | None = Field(default=None, description="Name of an existing Evaluation.")
+    test_case_name: str | None = Field(default=None, description="Optional producer-supplied test case name.")
+    evaluation_id: str | None = Field(
+        default=None,
+        deprecated=True,
+        description="Deprecated alias for evaluation_name. Use evaluation_name instead.",
+    )
+    test_case_id: str | None = Field(
+        default=None,
+        deprecated=True,
+        description="Deprecated alias for test_case_name. Use test_case_name instead.",
+    )
+
+    model_config = ConfigDict(extra="ignore")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_deprecated_fields(cls, data: Any) -> Any:
+        """Accept either spelling and keep both response fields consistent."""
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        cls._normalize_field_pair(normalized, canonical="evaluation_name", deprecated="evaluation_id")
+        cls._normalize_field_pair(normalized, canonical="test_case_name", deprecated="test_case_id")
+        return normalized
+
+    @staticmethod
+    def _normalize_field_pair(data: dict[str, Any], *, canonical: str, deprecated: str) -> None:
+        canonical_value = data.get(canonical)
+        deprecated_value = data.get(deprecated)
+        if canonical_value is not None and deprecated_value is not None and canonical_value != deprecated_value:
+            raise ValueError(f"{canonical} and deprecated {deprecated} must match when both are provided")
+        value = canonical_value if canonical_value is not None else deprecated_value
+        if value is not None:
+            data[canonical] = value
+            data[deprecated] = value
+
+    def has_values(self) -> bool:
+        return self.evaluation_name is not None or self.test_case_name is not None
 
 
 class Trace(BaseModel):
@@ -342,13 +447,13 @@ class Span(BaseModel):
     project: str | None = None
     evaluation_context: SpanEvaluationContext | None = None
     parent_span_id: str | None = None
-    kind: SpanKind
+    kind: ResponseSpanKind
     name: str | None = None
     source: str
     trace_id: str | None = None
     started_at: datetime
     ended_at: datetime | None = None
-    status: SpanStatus
+    status: ResponseSpanStatus
     error_type: str | None = None
     error_message: str | None = None
     provider: str | None = None
@@ -554,7 +659,7 @@ class Session(BaseModel):
     started_at: datetime
     ended_at: datetime | None = None
     duration_ms: float | None = None
-    status: SpanStatus
+    status: ResponseSpanStatus
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
     cached_tokens: int | None = Field(default=None, ge=0)
@@ -651,8 +756,8 @@ class DirectSpanInput(BaseModel):
     session_id: str | None = None
     parent_span_id: str | None = None
     name: str = ""
-    kind: SpanKind = "UNKNOWN"
-    status: SpanStatus = "unknown"
+    kind: SpanKind = SpanKind.UNKNOWN
+    status: SpanStatus = SpanStatus.UNKNOWN
     started_at: datetime
     ended_at: datetime | None = None
     input: JsonValue | None = None

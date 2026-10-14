@@ -4,7 +4,7 @@
 """Local ATIF domain models for Intake ingest.
 
 These models mirror the small Pydantic schema surface Intake needs from
-``nvidia-nat-atif`` without adding a service dependency on NAT packages.
+``nvidia-nat-atif`` without depending on NAT packages.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from nhx.intake.spans.ingest.evaluation_context import EvaluationContext
+from nemo_helix_plugin.intake.types import EvaluationContext
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing_extensions import TypeAliasType
 

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Map ATIF trajectories into Intake spans.
+"""Map ATIF trajectories into direct Intake span inputs.
 
 Preserved-only ATIF fields remain in ``raw_attributes`` when Intake has no
 dedicated span column for them. That includes agent tool definitions,
@@ -10,34 +10,31 @@ dedicated span column for them. That includes agent tool definitions,
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from nhx.intake.config import DEFAULT_ATIF_MAX_SUBAGENT_DEPTH, MAX_ATIF_MAX_SUBAGENT_DEPTH
-from nhx.intake.spans.domain import (
-    NEMO_STEP_ID_ATTRIBUTE,
-    EvaluatorResult,
-    EvaluatorResultDataType,
-    IntakeSpan,
-    SpanKind,
-    SpanStatus,
-)
-from nhx.intake.spans.ingest.atif_domain import (
+from nemo_helix_plugin.intake.atif_domain import (
     AtifMetrics,
     AtifObservation,
     AtifObservationResult,
     AtifStep,
     AtifStepAgent,
+    AtifStepUser,
     AtifSubagentTrajectoryRef,
     AtifToolCall,
     AtifTrajectory,
 )
-from nhx.intake.spans.ingest.evaluation_context import EvaluationContext
-from nhx.intake.spans.span_attribute_bags import SpanAttributeBags
-from nhx.intake.spans.span_semantic_attributes import SpanSemanticAttributes
-from nhx.intake.spans.storage import json_dumps, json_dumps_preserve, stable_id
+from nemo_helix_plugin.intake.types import DirectSpanInput, EvaluationContext, SpanAttributeKey, SpanKind, SpanStatus
 from pydantic import BaseModel
+
+# Source of spans mapped from ATIF, whether Intake maps them on /ingest/atif or a client sends them to /ingest/spans.
+ATIF_SOURCE = "atif"
+# Harbor's verifier payload key. The EVALUATOR span keeps the payload under it for evaluator_rewards.
+_VERIFIER_RESULT_KEY = "verifier_result"
+DEFAULT_ATIF_MAX_SUBAGENT_DEPTH = 64
+MAX_ATIF_MAX_SUBAGENT_DEPTH = 256
 
 TrajectoryIdentity = tuple[str, ...]
 
@@ -69,8 +66,12 @@ def trajectory_to_spans(
     trajectory: AtifTrajectory,
     ingested_at: datetime,
     max_subagent_depth: int = DEFAULT_ATIF_MAX_SUBAGENT_DEPTH,
-) -> list[IntakeSpan]:
-    """Map an ATIF trajectory tree into one trace of intake spans."""
+) -> list[DirectSpanInput]:
+    """Map an ATIF trajectory tree into one trace of intake spans.
+
+    Spans without producer timestamps start at ``ingested_at``. Spans are built without re-validation:
+    their values are JSON scalars or ``model_dump(mode="json")`` output, and attributes can be large.
+    """
     validate_atif_trajectory_depth(trajectory, max_subagent_depth=max_subagent_depth)
     return _trajectory_tree_to_spans(
         workspace=workspace,
@@ -94,7 +95,7 @@ def _trajectory_tree_to_spans(
     ingested_at: datetime,
     depth: int,
     max_subagent_depth: int,
-) -> list[IntakeSpan]:
+) -> list[DirectSpanInput]:
     """Recursively map a trajectory and its embedded subagents into spans."""
     if depth > max_subagent_depth:
         raise AtifTrajectoryDepthError(f"ATIF trajectory depth {depth} exceeds configured maximum {max_subagent_depth}")
@@ -132,7 +133,7 @@ def _trajectory_tree_to_spans(
             default_agent_name=trajectory.agent.name,
             default_agent_version=trajectory.agent.version,
             default_model_name=trajectory.agent.model_name,
-            external_parent_span_id=trajectory_span.external_span_id,
+            external_parent_span_id=trajectory_span.span_id,
             trajectory_identity=trajectory_identity,
             step=step,
             index=index,
@@ -147,7 +148,7 @@ def _trajectory_tree_to_spans(
                 default_agent_name=trajectory.agent.name,
                 default_agent_version=trajectory.agent.version,
                 default_model_name=trajectory.agent.model_name,
-                external_parent_span_id=step_span.external_span_id,
+                external_parent_span_id=step_span.span_id,
                 trajectory_identity=trajectory_identity,
                 step=step,
                 step_index=index,
@@ -170,8 +171,8 @@ def _trajectory_tree_to_spans(
                             trajectory=subagent,
                             trace_session_id=trace_session_id,
                             trajectory_identity=(*trajectory_identity, "subagent", subagent.trajectory_id),
-                            external_parent_span_id=step_span.external_span_id,
-                            ingested_at=step_span.start_time,
+                            external_parent_span_id=step_span.span_id,
+                            ingested_at=step_span.started_at,
                             depth=depth + 1,
                             max_subagent_depth=max_subagent_depth,
                         )
@@ -184,7 +185,7 @@ def _trajectory_tree_to_spans(
                         default_agent_name=trajectory.agent.name,
                         default_agent_version=trajectory.agent.version,
                         default_model_name=trajectory.agent.model_name,
-                        external_parent_span_id=step_span.external_span_id,
+                        external_parent_span_id=step_span.span_id,
                         trajectory_identity=trajectory_identity,
                         step=step,
                         step_index=index,
@@ -206,8 +207,8 @@ def _trajectory_tree_to_spans(
                 trajectory=subagent,
                 trace_session_id=trace_session_id,
                 trajectory_identity=(*trajectory_identity, "subagent", subagent.trajectory_id),
-                external_parent_span_id=trajectory_span.external_span_id,
-                ingested_at=trajectory_span.start_time,
+                external_parent_span_id=trajectory_span.span_id,
+                ingested_at=trajectory_span.started_at,
                 depth=depth + 1,
                 max_subagent_depth=max_subagent_depth,
             )
@@ -222,7 +223,7 @@ def _trajectory_span_id(
     trajectory_identity: TrajectoryIdentity,
 ) -> str:
     """Return the stable span ID for a trajectory at a tree identity."""
-    return stable_id(workspace, trace_session_id, *trajectory_identity, "trajectory", prefix="span")
+    return _stable_id(workspace, trace_session_id, *trajectory_identity, "trajectory", prefix="span")
 
 
 def _trajectory_to_span(
@@ -234,7 +235,7 @@ def _trajectory_to_span(
     external_parent_span_id: str | None,
     include_evaluation_context: bool,
     ingested_at: datetime,
-) -> IntakeSpan:
+) -> DirectSpanInput:
     """Map one trajectory node to its root agent span."""
     raw_attributes = _model_dict(trajectory)
     raw_attributes.pop("steps", None)
@@ -264,7 +265,7 @@ def _trajectory_to_span(
         else None
     )
     cost_total_usd = (
-        _decimal(final_metrics.total_cost_usd)
+        final_metrics.total_cost_usd
         if final_metrics is not None and not _trajectory_has_step_cost_metrics(trajectory)
         else None
     )
@@ -276,7 +277,7 @@ def _trajectory_to_span(
         trace_session_id=trace_session_id,
         trajectory_identity=trajectory_identity,
     )
-    attribute_bags = _span_attributes(
+    attributes = _span_attributes(
         model=trajectory.agent.model_name,
         agent_name=trajectory.agent.name,
         agent_version=trajectory.agent.version,
@@ -293,24 +294,19 @@ def _trajectory_to_span(
     trajectory_started_at = _trajectory_started_at(trajectory, ingested_at)
     # ATIF has no standard trajectory-level outcome field. Intake recognizes the
     # root ``extra.error`` convention; tool failures remain on their TOOL spans.
-    return IntakeSpan(
-        workspace=workspace,
+    return DirectSpanInput.model_construct(
         session_id=trace_session_id,
         trace_id=trace_session_id,
-        source_format="atif",
-        external_span_id=external_span_id,
-        external_parent_span_id=external_parent_span_id or "",
+        span_id=external_span_id,
+        parent_span_id=external_parent_span_id,
         kind=SpanKind.AGENT,
         name=trajectory.agent.name,
         status=SpanStatus.ERROR if trajectory_error is not None else SpanStatus.SUCCESS,
-        start_time=trajectory_started_at,
-        end_time=_clamped_end(trajectory_started_at, _trajectory_ended_at(trajectory)),
-        attributes_string=attribute_bags.string,
-        attributes_number=attribute_bags.number,
-        attributes_bool=attribute_bags.boolean,
+        started_at=trajectory_started_at,
+        ended_at=_clamped_end(trajectory_started_at, _trajectory_ended_at(trajectory)),
+        attributes=attributes,
         input=_trajectory_input(trajectory) or "",
         output=_trajectory_output(trajectory) or "",
-        event_ts=ingested_at,
     )
 
 
@@ -327,22 +323,22 @@ def _step_to_span(
     index: int,
     step_ended_at: datetime | None,
     ingested_at: datetime,
-) -> IntakeSpan:
+) -> DirectSpanInput:
     """Map one ATIF step to a child span in the shared trace."""
     raw_step = _model_dict(step)
     metrics = _step_metrics(step)
     model_name = _step_model_name(step)
     input_tokens = metrics.prompt_tokens if metrics is not None else None
     output_tokens = metrics.completion_tokens if metrics is not None else None
-    external_span_id = stable_id(
+    external_span_id = _stable_id(
         workspace,
         default_session_id,
         *trajectory_identity,
         str(index),
-        json_dumps(raw_step),
+        _json_dumps(raw_step),
         prefix="span",
     )
-    attribute_bags = _span_attributes(
+    attributes = _span_attributes(
         model=model_name or default_model_name,
         agent_name=default_agent_name,
         agent_version=default_agent_version,
@@ -350,29 +346,25 @@ def _step_to_span(
         output_tokens=output_tokens,
         cached_tokens=metrics.cached_tokens if metrics is not None else None,
         total_tokens=_sum_ints(input_tokens, output_tokens),
-        cost_total_usd=_decimal(metrics.cost_usd) if metrics is not None else None,
+        cost_total_usd=metrics.cost_usd if metrics is not None else None,
         raw_attributes=raw_step,
     )
-    attribute_bags.number[NEMO_STEP_ID_ATTRIBUTE] = float(step.step_id)
+    # A float like Intake's number bag, so raw_attributes keeps reading it back as 1.0.
+    attributes[SpanAttributeKey.STEP_ID] = float(step.step_id)
     step_started_at = _step_started_at(step, index, ingested_at)
-    return IntakeSpan(
-        workspace=workspace,
+    return DirectSpanInput.model_construct(
         session_id=default_session_id,
         trace_id=default_session_id,
-        source_format="atif",
-        external_span_id=external_span_id,
-        external_parent_span_id=external_parent_span_id,
+        span_id=external_span_id,
+        parent_span_id=external_parent_span_id,
         kind=_step_kind(step),
         name=(default_agent_name if isinstance(step, AtifStepAgent) else f"{step.source}-{step.step_id}"),
         status=SpanStatus.SUCCESS,
-        start_time=step_started_at,
-        end_time=_clamped_end(step_started_at, step_ended_at),
-        attributes_string=attribute_bags.string,
-        attributes_number=attribute_bags.number,
-        attributes_bool=attribute_bags.boolean,
+        started_at=step_started_at,
+        ended_at=_clamped_end(step_started_at, step_ended_at),
+        attributes=attributes,
         input=_step_input(step) or "",
         output=_step_output(step) or "",
-        event_ts=ingested_at,
     )
 
 
@@ -390,22 +382,22 @@ def _tool_call_to_span(
     tool_index: int,
     tool_call: AtifToolCall,
     ingested_at: datetime,
-) -> IntakeSpan:
+) -> DirectSpanInput:
     """Map one ATIF tool call to a span under its owning step."""
     raw_tool_call = _model_dict(tool_call)
     result = _observation_result_for_tool_call(step, tool_call.tool_call_id)
     error_message = _tool_result_error_message(step, result, tool_call.function_name)
-    external_span_id = stable_id(
+    external_span_id = _stable_id(
         workspace,
         default_session_id,
         *trajectory_identity,
         str(step_index),
         "tool",
         str(tool_index),
-        json_dumps(raw_tool_call),
+        _json_dumps(raw_tool_call),
         prefix="span",
     )
-    attribute_bags = _span_attributes(
+    attributes = _span_attributes(
         model=_step_model_name(step) or default_model_name,
         agent_name=default_agent_name,
         agent_version=default_agent_version,
@@ -419,24 +411,19 @@ def _tool_call_to_span(
     )
     invocation_started_at, invocation_ended_at = _invocation_window(tool_call.extra)
     tool_started_at = invocation_started_at or _step_started_at(step, step_index, ingested_at)
-    return IntakeSpan(
-        workspace=workspace,
+    return DirectSpanInput.model_construct(
         session_id=default_session_id,
         trace_id=default_session_id,
-        source_format="atif",
-        external_span_id=external_span_id,
-        external_parent_span_id=external_parent_span_id,
+        span_id=external_span_id,
+        parent_span_id=external_parent_span_id,
         kind=SpanKind.TOOL,
         name=tool_call.function_name,
         status=SpanStatus.ERROR if _tool_result_is_error(step, result, tool_call.function_name) else SpanStatus.SUCCESS,
-        start_time=tool_started_at,
-        end_time=_clamped_end(tool_started_at, invocation_ended_at),
-        attributes_string=attribute_bags.string,
-        attributes_number=attribute_bags.number,
-        attributes_bool=attribute_bags.boolean,
-        input=json_dumps_preserve(raw_tool_call),
+        started_at=tool_started_at,
+        ended_at=_clamped_end(tool_started_at, invocation_ended_at),
+        attributes=attributes,
+        input=_json_dumps_preserve(raw_tool_call),
         output=_string_or_json(result) or "",
-        event_ts=ingested_at,
     )
 
 
@@ -457,13 +444,13 @@ def _subagent_ref_to_span(
     subagent_ref: AtifSubagentTrajectoryRef,
     step_ended_at: datetime | None,
     ingested_at: datetime,
-) -> IntakeSpan:
+) -> DirectSpanInput:
     """Map an unexpanded subagent reference to a delegation span."""
     raw_result = _model_dict(result)
     raw_ref = _model_dict(subagent_ref)
     error_message = _tool_result_error_message(step, result)
     subagent_identity = _subagent_ref_identity(subagent_ref)
-    external_span_id = stable_id(
+    external_span_id = _stable_id(
         workspace,
         default_session_id,
         *trajectory_identity,
@@ -474,7 +461,7 @@ def _subagent_ref_to_span(
         subagent_identity,
         prefix="span",
     )
-    attribute_bags = _span_attributes(
+    attributes = _span_attributes(
         model=_step_model_name(step) or default_model_name,
         agent_name=default_agent_name,
         agent_version=default_agent_version,
@@ -486,24 +473,19 @@ def _subagent_ref_to_span(
         },
     )
     subagent_started_at = _step_started_at(step, step_index, ingested_at)
-    return IntakeSpan(
-        workspace=workspace,
+    return DirectSpanInput.model_construct(
         session_id=default_session_id,
         trace_id=default_session_id,
-        source_format="atif",
-        external_span_id=external_span_id,
-        external_parent_span_id=external_parent_span_id,
+        span_id=external_span_id,
+        parent_span_id=external_parent_span_id,
         kind=SpanKind.AGENT,
         name=f"subagent-{subagent_identity}",
         status=SpanStatus.ERROR if _tool_result_is_error(step, result) else SpanStatus.SUCCESS,
-        start_time=subagent_started_at,
-        end_time=_clamped_end(subagent_started_at, step_ended_at),
-        attributes_string=attribute_bags.string,
-        attributes_number=attribute_bags.number,
-        attributes_bool=attribute_bags.boolean,
-        input=json_dumps_preserve(raw_ref),
-        output=json_dumps_preserve(raw_result),
-        event_ts=ingested_at,
+        started_at=subagent_started_at,
+        ended_at=_clamped_end(subagent_started_at, step_ended_at),
+        attributes=attributes,
+        input=_json_dumps_preserve(raw_ref),
+        output=_json_dumps_preserve(raw_result),
     )
 
 
@@ -513,12 +495,12 @@ def _evaluator_result_to_span(
     trajectory: AtifTrajectory,
     trace_session_id: str,
     trajectory_identity: TrajectoryIdentity,
-    parent_span: IntakeSpan,
+    parent_span: DirectSpanInput,
     ingested_at: datetime,
-) -> list[IntakeSpan]:
+) -> list[DirectSpanInput]:
     """Map a trajectory verifier result to its evaluator span, when present."""
     extra = trajectory.extra or {}
-    verifier_result = _dict_or_none(extra.get("verifier_result"))
+    verifier_result = _dict_or_none(extra.get(_VERIFIER_RESULT_KEY))
     if verifier_result is None:
         return []
     verifier = _dict_or_none(extra.get("verifier"))
@@ -527,7 +509,7 @@ def _evaluator_result_to_span(
         key: value
         for key, value in {
             "session_id": trace_session_id,
-            "evaluated_span_id": parent_span.external_span_id,
+            "evaluated_span_id": parent_span.span_id,
             "task_id": extra.get("task_id"),
             "task_name": extra.get("task_name"),
             "trial_name": extra.get("trial_name"),
@@ -537,7 +519,7 @@ def _evaluator_result_to_span(
     }
     output_value = {
         "score": score,
-        "verifier_result": verifier_result,
+        _VERIFIER_RESULT_KEY: verifier_result,
     }
     metadata = {
         key: value
@@ -549,11 +531,11 @@ def _evaluator_result_to_span(
         }.items()
         if value is not None
     }
-    input_json = json_dumps_preserve(input_value)
-    output_json = json_dumps_preserve(output_value)
-    metadata_json = json_dumps_preserve(metadata)
+    input_json = _json_dumps_preserve(input_value)
+    output_json = _json_dumps_preserve(output_value)
+    metadata_json = _json_dumps_preserve(metadata)
     raw_attributes = {
-        "openinference.span.kind": "EVALUATOR",
+        "openinference.span.kind": SpanKind.EVALUATOR,
         "input.value": input_json,
         "input.mime_type": "application/json",
         "output.value": output_json,
@@ -562,43 +544,38 @@ def _evaluator_result_to_span(
         "event_type": "evaluator_result",
         "name": "harbor.verifier",
         "score": score,
-        "verifier_result": verifier_result,
+        _VERIFIER_RESULT_KEY: verifier_result,
     }
     started_at = _evaluator_started_at(trajectory) or ingested_at
     ended_at = _evaluator_ended_at(trajectory)
-    external_span_id = stable_id(
+    external_span_id = _stable_id(
         workspace,
         trace_session_id,
         *trajectory_identity,
         "evaluator",
-        json_dumps(raw_attributes),
+        _json_dumps(raw_attributes),
         prefix="span",
     )
-    attribute_bags = _span_attributes(
+    attributes = _span_attributes(
         model=trajectory.agent.model_name,
         agent_name=trajectory.agent.name,
         agent_version=trajectory.agent.version,
         raw_attributes=raw_attributes,
     )
     return [
-        IntakeSpan(
-            workspace=workspace,
+        DirectSpanInput.model_construct(
             session_id=trace_session_id,
             trace_id=trace_session_id,
-            source_format="atif",
-            external_span_id=external_span_id,
-            external_parent_span_id=parent_span.external_span_id,
+            span_id=external_span_id,
+            parent_span_id=parent_span.span_id,
             kind=SpanKind.EVALUATOR,
             name="harbor.verifier",
             status=SpanStatus.SUCCESS,
-            start_time=started_at,
-            end_time=ended_at,
-            attributes_string=attribute_bags.string,
-            attributes_number=attribute_bags.number,
-            attributes_bool=attribute_bags.boolean,
+            started_at=started_at,
+            ended_at=ended_at,
+            attributes=attributes,
             input=input_json,
             output=output_json,
-            event_ts=ingested_at,
         )
     ]
 
@@ -616,88 +593,31 @@ def _span_attributes(
     output_tokens: int | None = None,
     cached_tokens: int | None = None,
     total_tokens: int | None = None,
-    cost_total_usd: Decimal | None = None,
+    cost_total_usd: float | None = None,
     raw_attributes: dict[str, Any] | None = None,
-) -> SpanAttributeBags:
-    """Build normalized semantic and raw attribute bags for an ATIF span."""
-    semantic_attributes = SpanSemanticAttributes(
-        model=model,
-        agent_name=agent_name,
-        agent_version=agent_version,
-        evaluation_name=evaluation_context.evaluation_name if evaluation_context is not None else None,
-        test_case_name=evaluation_context.test_case_name if evaluation_context is not None else None,
-        tool_name=tool_name,
-        error_type=error_type,
-        error_message=error_message,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cached_tokens=cached_tokens,
-        total_tokens=total_tokens,
-        cost_total_usd=cost_total_usd,
-    )
-    attribute_bags = semantic_attributes.to_bags()
-    if raw_attributes is not None:
-        attribute_bags.put_json("atif.raw", raw_attributes)
-    return attribute_bags
-
-
-def trajectory_to_evaluator_results(
-    *,
-    workspace: str,
-    trajectory: AtifTrajectory,
-    spans: list[IntakeSpan],
-    ingested_at: datetime,
-    max_subagent_depth: int = DEFAULT_ATIF_MAX_SUBAGENT_DEPTH,
-) -> list[EvaluatorResult]:
-    """Extract evaluator_results rows from an ATIF trajectory tree's verifier_result blocks.
-
-    Emits one row per Harbor reward key (``verifier_result.rewards``), named by that
-    key, targeting the EVALUATOR-kind span that ``trajectory_to_spans`` produced for
-    the verifier. The span preserves the original tree structure; these rows make each
-    score queryable by name and value without parsing the span payload.
-    """
-    validate_atif_trajectory_depth(trajectory, max_subagent_depth=max_subagent_depth)
-    results: list[EvaluatorResult] = []
-    for current_trajectory, trajectory_identity, _depth in _trajectory_tree(trajectory):
-        verifier_result = _dict_or_none((current_trajectory.extra or {}).get("verifier_result"))
-        if verifier_result is None:
-            continue
-        trajectory_span_id = _trajectory_span_id(
-            workspace=workspace,
-            trace_session_id=trajectory.session_id,
-            trajectory_identity=trajectory_identity,
-        )
-        evaluator_span = next(
-            (
-                span
-                for span in spans
-                if span.kind == SpanKind.EVALUATOR and span.external_parent_span_id == trajectory_span_id
-            ),
-            None,
-        )
-        if evaluator_span is None:
-            continue
-        for name, raw_value in _evaluator_rewards(verifier_result):
-            data_type, value, string_value = _coerce_evaluator_value(raw_value)
-            results.append(
-                EvaluatorResult(
-                    # Per-key id: the reward name keeps each criterion's row distinct on the
-                    # same span, and an identical re-ingest hashes to the same id (dedupe).
-                    evaluator_result_id=stable_id(evaluator_span.external_span_id, name, prefix="eval"),
-                    span_id=evaluator_span.external_span_id,
-                    session_id=trajectory.session_id,
-                    workspace=workspace,
-                    name=name,
-                    value=value,
-                    string_value=string_value,
-                    data_type=data_type,
-                    comment=None,
-                    created_by="intake:atif_importer",
-                    created_at=ingested_at,
-                    ingested_at=ingested_at,
-                )
-            )
-    return results
+) -> dict[str, Any]:
+    """Build an ATIF span's semantic attributes, under source keys Intake normalizes, and its raw fields."""
+    semantic_attributes = {
+        SpanAttributeKey.MODEL: model,
+        SpanAttributeKey.AGENT_NAME: agent_name,
+        SpanAttributeKey.AGENT_VERSION: agent_version,
+        SpanAttributeKey.EVALUATION_NAME: evaluation_context.evaluation_name
+        if evaluation_context is not None
+        else None,
+        SpanAttributeKey.TEST_CASE_NAME: evaluation_context.test_case_name if evaluation_context is not None else None,
+        SpanAttributeKey.TOOL_NAME: tool_name,
+        SpanAttributeKey.ERROR_TYPE: error_type,
+        SpanAttributeKey.ERROR_MESSAGE: error_message,
+        SpanAttributeKey.INPUT_TOKENS: input_tokens,
+        SpanAttributeKey.OUTPUT_TOKENS: output_tokens,
+        SpanAttributeKey.CACHED_TOKENS: cached_tokens,
+        SpanAttributeKey.TOTAL_TOKENS: total_tokens,
+        SpanAttributeKey.COST_TOTAL_USD: cost_total_usd,
+    }
+    return {
+        **{key: value for key, value in semantic_attributes.items() if value is not None},
+        **(raw_attributes or {}),
+    }
 
 
 def _trajectory_tree(
@@ -720,36 +640,6 @@ def _trajectory_tree(
                 )
             )
     return trajectories
-
-
-def _evaluator_rewards(verifier_result: dict[str, Any]) -> list[tuple[str, bool | int | float | str]]:
-    """Per-reward ``(name, value)`` pairs from a Harbor ``verifier_result``.
-
-    Harbor writes a ``rewards`` dict (``reward.json``) whose keys are the metric
-    identities — one named reward per ``tests/`` subdirectory, or the 1D
-    ``{"reward": <score>}`` convention. Each key becomes its own evaluator_result, so
-    multi-criterion verifiers keep their per-criterion breakdown and keys (incl.
-    namespaced ones like ``v1/correctness``) pass through verbatim. Falls back to a
-    single ``reward`` row when only a bare top-level ``score`` scalar is present.
-    """
-    rewards = verifier_result.get("rewards")
-    if isinstance(rewards, dict):
-        return [(name, value) for name, value in rewards.items() if isinstance(value, (int, float, str))]
-    score = verifier_result.get("score")
-    if isinstance(score, (int, float, str)):
-        return [("reward", score)]
-    return []
-
-
-def _coerce_evaluator_value(
-    score: bool | int | float | str,
-) -> tuple[EvaluatorResultDataType, float | None, str | None]:
-    """Coerce an ATIF reward into evaluator result storage columns."""
-    if isinstance(score, bool):
-        return EvaluatorResultDataType.BOOLEAN, 1.0 if score else 0.0, None
-    if isinstance(score, (int, float)):
-        return EvaluatorResultDataType.NUMERIC, float(score), None
-    return EvaluatorResultDataType.TEXT, None, str(score)
 
 
 def _subagent_ref_identity(subagent_ref: AtifSubagentTrajectoryRef) -> str:
@@ -784,7 +674,7 @@ def _step_output(step: AtifStep) -> str | None:
             payload["reasoning_content"] = step.reasoning_content
         if step.tool_calls is not None:
             payload["tool_calls"] = [_model_dict(tool_call) for tool_call in step.tool_calls]
-        return json_dumps_preserve(payload) if payload else None
+        return _json_dumps_preserve(payload) if payload else None
     return None
 
 
@@ -830,7 +720,7 @@ def _trajectory_has_step_cost_metrics(trajectory: AtifTrajectory) -> bool:
 def _trajectory_input(trajectory: AtifTrajectory) -> str | None:
     """Return the first user message from a trajectory."""
     for step in trajectory.steps:
-        if step.source == "user":
+        if isinstance(step, AtifStepUser):
             return _string_or_json(step.message)
     return None
 
@@ -1090,6 +980,29 @@ def _non_empty_string(value: Any) -> str | None:
     return stripped or None
 
 
+def evaluator_rewards(span: DirectSpanInput) -> list[tuple[str, bool | int | float | str]]:
+    """Per-reward ``(name, value)`` pairs on an EVALUATOR span mapped from a Harbor ``verifier_result``.
+
+    Harbor writes a ``rewards`` dict (``reward.json``) whose keys are the metric
+    identities: one named reward per ``tests/`` subdirectory, or the 1D
+    ``{"reward": <score>}`` convention. Keys (incl. namespaced ones like
+    ``v1/correctness``) pass through verbatim. Falls back to a single ``reward``
+    pair when only a bare top-level ``score`` scalar is present.
+    """
+    verifier_result = (
+        _dict_or_none(span.attributes.get(_VERIFIER_RESULT_KEY)) if span.kind == SpanKind.EVALUATOR else None
+    )
+    if verifier_result is None:
+        return []
+    rewards = verifier_result.get("rewards")
+    if isinstance(rewards, dict):
+        return [(name, value) for name, value in rewards.items() if isinstance(value, (int, float, str))]
+    score = verifier_result.get("score")
+    if isinstance(score, (int, float, str)):
+        return [("reward", score)]
+    return []
+
+
 def _evaluator_score(verifier_result: dict[str, Any]) -> bool | int | float | str | None:
     """Extract the primary scalar score from a verifier result."""
     score = verifier_result.get("score")
@@ -1114,7 +1027,7 @@ def _string_or_json(value: Any) -> str | None:
         return None
     if isinstance(value, str):
         return value
-    return json_dumps_preserve(_json_value(value))
+    return _json_dumps_preserve(_json_value(value))
 
 
 def _json_value(value: Any) -> Any:
@@ -1133,19 +1046,29 @@ def _model_dict(model: BaseModel) -> dict[str, Any]:
     return model.model_dump(mode="json", exclude_none=True)
 
 
-def _decimal(value: Any) -> Decimal | None:
-    """Coerce a value to Decimal without raising for invalid input."""
-    if value is None:
-        return None
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return None
-
-
 def _sum_ints(*values: int | None) -> int | None:
     """Sum present integer values or return None when all are absent."""
     present = [value for value in values if value is not None]
     if not present:
         return None
     return sum(present)
+
+
+# ATIF span ids hash these exact bytes, so changing them re-keys every stored ATIF span (pinned by Intake's
+# ATIF tests). They match nhx.intake.spans.storage, which keeps its own copies for Intake's other ids.
+def _stable_id(*parts: str, prefix: str | None = None) -> str:
+    hasher = hashlib.sha256()
+    for part in parts:
+        encoded = part.encode("utf-8")
+        hasher.update(len(encoded).to_bytes(8, byteorder="big", signed=False))
+        hasher.update(encoded)
+    digest = hasher.hexdigest()
+    return f"{prefix}-{digest[:32]}" if prefix else digest[:32]
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _json_dumps_preserve(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)

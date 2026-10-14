@@ -7,12 +7,11 @@ import os
 from pathlib import Path
 from typing import Any, cast
 
+from nemo_helix_plugin.intake.atif_mapping import DEFAULT_ATIF_MAX_SUBAGENT_DEPTH, MAX_ATIF_MAX_SUBAGENT_DEPTH
 from nhx.common.config import EnvironmentFirstSettings, create_service_config_class
 from pydantic import Field
 from pydantic_settings import SettingsConfigDict
 
-DEFAULT_ATIF_MAX_SUBAGENT_DEPTH = 64
-MAX_ATIF_MAX_SUBAGENT_DEPTH = 256
 DEFAULT_SPAN_RETENTION_DAYS = 90
 DEFAULT_CLICKHOUSE_URL = "http://localhost:8123"
 DEFAULT_CLICKHOUSE_VERSION = "26.3"

@@ -18,6 +18,8 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum, StrEnum
 from typing import Any
 
+from nemo_helix_plugin.intake.types import SpanAttributeKey
+
 
 # Storage bag names: the three ClickHouse Map columns used for span attributes.
 class AttributeBag(StrEnum):
@@ -76,7 +78,7 @@ ATTRIBUTE_SPECS = (
         bag=AttributeBag.STRING,
         bag_key="gen_ai.request.model",
         source_keys=(
-            "gen_ai.request.model",
+            SpanAttributeKey.MODEL,
             "gen_ai.response.model",
             "llm.model_name",
         ),
@@ -86,7 +88,7 @@ ATTRIBUTE_SPECS = (
         bag=AttributeBag.STRING,
         bag_key="gen_ai.system",
         source_keys=(
-            "gen_ai.system",
+            SpanAttributeKey.PROVIDER,
             "gen_ai.provider.name",
             "llm.provider",
             "llm.system",
@@ -97,7 +99,7 @@ ATTRIBUTE_SPECS = (
         bag=AttributeBag.STRING,
         bag_key="prompt.id",
         source_keys=(
-            "gen_ai.prompt.id",
+            SpanAttributeKey.PROMPT_ID,
             "prompt.id",
         ),
     ),
@@ -106,7 +108,7 @@ ATTRIBUTE_SPECS = (
         bag=AttributeBag.STRING,
         bag_key="gen_ai.agent.id",
         source_keys=(
-            "gen_ai.agent.id",
+            SpanAttributeKey.AGENT_ID,
             "agent.id",
         ),
     ),
@@ -115,7 +117,7 @@ ATTRIBUTE_SPECS = (
         bag=AttributeBag.STRING,
         bag_key="gen_ai.agent.name",
         source_keys=(
-            "gen_ai.agent.name",
+            SpanAttributeKey.AGENT_NAME,
             "llm.agent.name",
             "agent.name",
         ),
@@ -125,7 +127,7 @@ ATTRIBUTE_SPECS = (
         bag=AttributeBag.STRING,
         bag_key="agent.version",
         source_keys=(
-            "gen_ai.agent.version",
+            SpanAttributeKey.AGENT_VERSION,
             "agent.version",
         ),
     ),
@@ -134,7 +136,7 @@ ATTRIBUTE_SPECS = (
         bag=AttributeBag.STRING,
         bag_key="gen_ai.tool.name",
         source_keys=(
-            "gen_ai.tool.name",
+            SpanAttributeKey.TOOL_NAME,
             "tool.name",
         ),
     ),
@@ -143,7 +145,7 @@ ATTRIBUTE_SPECS = (
         bag=AttributeBag.STRING,
         bag_key="project.name",
         source_keys=(
-            "gen_ai.project",
+            SpanAttributeKey.PROJECT,
             "project.name",
             "project",
         ),
@@ -156,34 +158,34 @@ ATTRIBUTE_SPECS = (
         # and normalized to the canonical key, so producers can migrate independently without dropping
         # their evaluation association.
         bag_key="nemo.evaluation.name",
-        source_keys=("nemo.evaluation.name", "nemo.experiment.id"),
+        source_keys=(SpanAttributeKey.EVALUATION_NAME, "nemo.experiment.id"),
         bag_aliases=("nemo.experiment.id",),
     ),
     AttributeSpec(
         field=SpanAttributeField.TEST_CASE_NAME,
         bag=AttributeBag.STRING,
         bag_key="nemo.test_case.name",
-        source_keys=("nemo.test_case.name", "nemo.test_case.id"),
+        source_keys=(SpanAttributeKey.TEST_CASE_NAME, "nemo.test_case.id"),
         bag_aliases=("nemo.test_case.id",),
     ),
     AttributeSpec(
         field=SpanAttributeField.ERROR_TYPE,
         bag=AttributeBag.STRING,
         bag_key="exception.type",
-        source_keys=("exception.type",),
+        source_keys=(SpanAttributeKey.ERROR_TYPE,),
     ),
     AttributeSpec(
         field=SpanAttributeField.ERROR_MESSAGE,
         bag=AttributeBag.STRING,
         bag_key="exception.message",
-        source_keys=("exception.message",),
+        source_keys=(SpanAttributeKey.ERROR_MESSAGE,),
     ),
     AttributeSpec(
         field=SpanAttributeField.INPUT_TOKENS,
         bag=AttributeBag.NUMBER,
         bag_key="llm.token_count.prompt",
         source_keys=(
-            "gen_ai.usage.input_tokens",
+            SpanAttributeKey.INPUT_TOKENS,
             "llm.token_count.prompt",
         ),
     ),
@@ -192,7 +194,7 @@ ATTRIBUTE_SPECS = (
         bag=AttributeBag.NUMBER,
         bag_key="llm.token_count.completion",
         source_keys=(
-            "gen_ai.usage.output_tokens",
+            SpanAttributeKey.OUTPUT_TOKENS,
             "llm.token_count.completion",
         ),
     ),
@@ -201,7 +203,7 @@ ATTRIBUTE_SPECS = (
         bag=AttributeBag.NUMBER,
         bag_key="llm.token_count.cached",
         source_keys=(
-            "gen_ai.usage.cached_tokens",
+            SpanAttributeKey.CACHED_TOKENS,
             "gen_ai.usage.input_cache_tokens",
             "llm.token_count.prompt_details.cache_read",
             "llm.token_count.cached",
@@ -212,7 +214,7 @@ ATTRIBUTE_SPECS = (
         bag=AttributeBag.NUMBER,
         bag_key="llm.token_count.total",
         source_keys=(
-            "gen_ai.usage.total_tokens",
+            SpanAttributeKey.TOTAL_TOKENS,
             "llm.token_count.total",
         ),
     ),
@@ -220,32 +222,32 @@ ATTRIBUTE_SPECS = (
         field=SpanAttributeField.PROMPT_CACHE_WRITE_TOKENS,
         bag=AttributeBag.NUMBER,
         bag_key="llm.token_count.prompt_details.cache_write",
-        source_keys=("llm.token_count.prompt_details.cache_write",),
+        source_keys=(SpanAttributeKey.PROMPT_CACHE_WRITE_TOKENS,),
     ),
     AttributeSpec(
         field=SpanAttributeField.PROMPT_AUDIO_TOKENS,
         bag=AttributeBag.NUMBER,
         bag_key="llm.token_count.prompt_details.audio",
-        source_keys=("llm.token_count.prompt_details.audio",),
+        source_keys=(SpanAttributeKey.PROMPT_AUDIO_TOKENS,),
     ),
     AttributeSpec(
         field=SpanAttributeField.COMPLETION_REASONING_TOKENS,
         bag=AttributeBag.NUMBER,
         bag_key="llm.token_count.completion_details.reasoning",
-        source_keys=("llm.token_count.completion_details.reasoning",),
+        source_keys=(SpanAttributeKey.COMPLETION_REASONING_TOKENS,),
     ),
     AttributeSpec(
         field=SpanAttributeField.COMPLETION_AUDIO_TOKENS,
         bag=AttributeBag.NUMBER,
         bag_key="llm.token_count.completion_details.audio",
-        source_keys=("llm.token_count.completion_details.audio",),
+        source_keys=(SpanAttributeKey.COMPLETION_AUDIO_TOKENS,),
     ),
     AttributeSpec(
         field=SpanAttributeField.COST_TOTAL_USD,
         bag=AttributeBag.NUMBER,
         bag_key="cost.total",
         source_keys=(
-            "gen_ai.usage.cost",
+            SpanAttributeKey.COST_TOTAL_USD,
             "llm.cost.total",
         ),
         scale=COST_SCALE,
@@ -254,14 +256,14 @@ ATTRIBUTE_SPECS = (
         field=SpanAttributeField.COST_INPUT_USD,
         bag=AttributeBag.NUMBER,
         bag_key="cost.input",
-        source_keys=("llm.cost.prompt",),
+        source_keys=(SpanAttributeKey.COST_INPUT_USD,),
         scale=COST_SCALE,
     ),
     AttributeSpec(
         field=SpanAttributeField.COST_OUTPUT_USD,
         bag=AttributeBag.NUMBER,
         bag_key="cost.output",
-        source_keys=("llm.cost.completion",),
+        source_keys=(SpanAttributeKey.COST_OUTPUT_USD,),
         scale=COST_SCALE,
     ),
 )

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from nemo_helix_plugin.intake.types import EvaluationContext
 from nhx.common.entities.client import EntityClient
 from nhx.common.service.dependencies import get_entity_client
 from nhx.intake.config import IntakeConfig
@@ -16,7 +17,6 @@ from nhx.intake.spans.domain import (
     SpanStatus,
     TraceBatch,
 )
-from nhx.intake.spans.ingest.evaluation_context import EvaluationContext
 from nhx.intake.spans.ingest.evaluation_context_validation import validate_evaluation_context
 from nhx.intake.spans.span_attribute_catalog import SpanAttributeField, spec_for_field
 from nhx.intake.spans.span_semantic_attributes import SpanSemanticAttributes

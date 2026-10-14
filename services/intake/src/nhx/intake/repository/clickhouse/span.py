@@ -9,11 +9,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from nemo_helix_plugin.intake.types import SpanAttributeKey
 from nhx.common.api.common import PaginatedResult
 from nhx.intake.repository.clickhouse.executor import ClickHouseExecutor, ClickHouseInsert, ClickHouseQuery
 from nhx.intake.repository.clickhouse.tables import ClickHouseTable
 from nhx.intake.repository.span import SpanRepository
-from nhx.intake.spans.domain import NEMO_STEP_ID_ATTRIBUTE, IntakeResponseMode, IntakeSpan, SpanGroup, SpanListFilter
+from nhx.intake.spans.domain import IntakeResponseMode, IntakeSpan, SpanGroup, SpanListFilter
 from nhx.intake.spans.span_attribute_catalog import where_clause
 from nhx.intake.spans.storage import (
     dict_to_row,
@@ -348,7 +349,7 @@ def _order_by(sort: str) -> str:
     column = SPAN_SORT_COLUMNS.get(field)
     if column is None:
         raise ValueError(f"Unsupported span sort field: {field}")
-    nemo_step_id = f"nullIf(attributes_number['{NEMO_STEP_ID_ATTRIBUTE}'], 0)"
+    nemo_step_id = f"nullIf(attributes_number['{SpanAttributeKey.STEP_ID}'], 0)"
     return f"{column} {direction}, {nemo_step_id} {direction} NULLS LAST, id ASC"
 
 

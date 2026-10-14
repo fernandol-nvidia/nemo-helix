@@ -10,9 +10,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Self
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from nemo_helix_plugin.intake.types import DirectSpanInput as _DirectSpanInput
+from nemo_helix_plugin.intake.types import SpanAttributeKey
 from nhx.intake.config import DEFAULT_SPAN_RETENTION_DAYS
 from nhx.intake.spans.api.dependencies import DenormalizerDep, SpansServiceDep, require_workspace_access
-from nhx.intake.spans.domain import NEMO_STEP_ID_ATTRIBUTE, IntakeSpan, SpanKind, SpanStatus, TraceBatch
+from nhx.intake.spans.domain import IntakeSpan, TraceBatch
 from nhx.intake.spans.span_attribute_bags import DIRECT_INGEST_RAW_ATTRIBUTES_KEY
 from nhx.intake.spans.span_semantic_attributes import SpanSemanticAttributes
 from nhx.intake.spans.storage import json_dumps_preserve, utc_now
@@ -36,23 +38,14 @@ SourceName = Annotated[
 ]
 
 
-class DirectSpanInput(BaseModel):
+class DirectSpanInput(_DirectSpanInput):
     """One provider-neutral span supplied by a historical trace importer."""
-
-    model_config = ConfigDict(extra="forbid")
 
     span_id: DirectSpanIdentifier
     trace_id: DirectSpanIdentifier
     session_id: DirectSpanIdentifier | None = None
     parent_span_id: DirectSpanIdentifier | None = None
     name: DirectSpanName = ""
-    kind: SpanKind = SpanKind.UNKNOWN
-    status: SpanStatus = SpanStatus.UNKNOWN
-    started_at: datetime
-    ended_at: datetime | None = None
-    input: JsonValue | None = None
-    output: JsonValue | None = None
-    attributes: dict[str, JsonValue] = Field(default_factory=dict)
 
     @field_validator("started_at", "ended_at")
     @classmethod
@@ -145,17 +138,17 @@ def direct_span_to_domain(
     *,
     workspace: str,
     source: str,
-    span: DirectSpanInput,
+    span: _DirectSpanInput,
     ingested_at: datetime,
 ) -> tuple[IntakeSpan, SpanSemanticAttributes]:
     semantic_attributes, consumed_keys = SpanSemanticAttributes.from_source_attributes(span.attributes)
     attribute_bags = semantic_attributes.to_bags()
     raw_attributes = {key: value for key, value in span.attributes.items() if key not in consumed_keys}
-    # Span lists break start-time ties by the number-bag nemo.step_id, which the ATIF route also writes.
-    step_id = raw_attributes.get(NEMO_STEP_ID_ATTRIBUTE)
+    # Span lists break start-time ties by the number-bag step id, so keep a numeric copy there.
+    step_id = raw_attributes.get(SpanAttributeKey.STEP_ID)
     if isinstance(step_id, int | float) and not isinstance(step_id, bool):
         with suppress(OverflowError):
-            attribute_bags.number[NEMO_STEP_ID_ATTRIBUTE] = float(step_id)
+            attribute_bags.number[SpanAttributeKey.STEP_ID] = float(step_id)
     if raw_attributes:
         attribute_bags.put_json(DIRECT_INGEST_RAW_ATTRIBUTES_KEY, raw_attributes)
     intake_span = IntakeSpan(

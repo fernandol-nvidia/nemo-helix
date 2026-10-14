@@ -8,18 +8,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
-from nhx.intake.spans.api.spans_schemas import Span
-from nhx.intake.spans.domain import NEMO_STEP_ID_ATTRIBUTE, SpanKind, SpanStatus
-from nhx.intake.spans.ingest.atif import AtifIngestRequest
-from nhx.intake.spans.ingest.atif_domain import (
+from nemo_helix_plugin.intake.atif_domain import (
     AtifAgent,
     AtifStepAgent,
     AtifStepUser,
     AtifSubagentTrajectoryRef,
     AtifTrajectory,
 )
-from nhx.intake.spans.ingest.atif_mapping import AtifTrajectoryDepthError, _step_observation, trajectory_to_spans
-from nhx.intake.spans.ingest.evaluation_context import EvaluationContext
+from nemo_helix_plugin.intake.atif_mapping import AtifTrajectoryDepthError, _step_observation
+from nemo_helix_plugin.intake.types import EvaluationContext, SpanAttributeKey
+from nhx.intake.spans.api.spans_schemas import Span
+from nhx.intake.spans.domain import SpanKind, SpanStatus
+from nhx.intake.spans.ingest.atif import AtifIngestRequest, atif_trace_batch
+from nhx.intake.spans.span_attribute_bags import DIRECT_INGEST_RAW_ATTRIBUTES_KEY
 from pydantic import ValidationError
 
 EVALUATION_CONTEXT: dict[str, Any] = {
@@ -216,11 +217,11 @@ def test_atif_v17_embedded_subagents_expand_recursively_in_the_parent_trace() ->
         }
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
 
     root = next(span for span in spans if span.name == "root-agent")
     root_delegation = next(
@@ -254,8 +255,8 @@ def test_atif_v17_embedded_subagents_expand_recursively_in_the_parent_trace() ->
     assert review.status == SpanStatus.SUCCESS
     assert failed_tool.status == SpanStatus.ERROR
 
-    root_raw = json.loads(root.attributes_string["atif.raw"])
-    research_raw = json.loads(research.attributes_string["atif.raw"])
+    root_raw = json.loads(root.attributes_string[DIRECT_INGEST_RAW_ATTRIBUTES_KEY])
+    research_raw = json.loads(research.attributes_string[DIRECT_INGEST_RAW_ATTRIBUTES_KEY])
     assert "subagent_trajectories" not in root_raw
     assert research_raw["trajectory_id"] == "research-trajectory"
     assert "subagent_trajectories" not in research_raw
@@ -268,19 +269,19 @@ def test_atif_v17_subagent_depth_is_bounded_before_mapping() -> None:
         AtifTrajectoryDepthError,
         match="ATIF trajectory depth 3 exceeds configured maximum 2",
     ):
-        trajectory_to_spans(
+        atif_trace_batch(
             workspace="default",
             trajectory=trajectory,
             ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
             max_subagent_depth=2,
-        )
+        ).spans
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
         max_subagent_depth=3,
-    )
+    ).spans
     assert [span.name for span in spans] == ["agent-1", "agent-2", "agent-3"]
 
 
@@ -320,11 +321,11 @@ def test_atif_v17_timestamp_free_subagent_starts_at_delegating_step() -> None:
         }
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=ingested_at,
-    )
+    ).spans
     delegation = next(span for span in spans if span.name == "root-agent" and span.kind == SpanKind.LLM)
     worker = next(span for span in spans if span.name == "worker-agent")
     worker_step = next(
@@ -378,11 +379,11 @@ def test_atif_v17_sibling_subagents_can_share_a_session_without_span_id_collisio
         }
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
 
     worker_roots = [span for span in spans if span.name == "worker"]
     worker_steps = [
@@ -504,11 +505,11 @@ def test_atif_mapping_writes_evaluation_context_only_on_root_span() -> None:
         steps=[AtifStepUser(step_id=1, source="user", message="solve")],
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
 
     root = next(span for span in spans if span.name == "sample-agent")
     child = next(span for span in spans if span.name == "user-1")
@@ -552,13 +553,14 @@ def test_atif_mapping_persists_step_order_when_timestamps_match() -> None:
         }
     )
 
-    spans = trajectory_to_spans(workspace="default", trajectory=trajectory, ingested_at=timestamp)
-    steps = [span for span in spans if NEMO_STEP_ID_ATTRIBUTE in span.attributes_number]
+    spans = atif_trace_batch(workspace="default", trajectory=trajectory, ingested_at=timestamp).spans
+    steps = [span for span in spans if SpanAttributeKey.STEP_ID in span.attributes_number]
 
-    assert [(span.name, span.start_time, span.attributes_number[NEMO_STEP_ID_ATTRIBUTE]) for span in steps] == [
+    assert [(span.name, span.start_time, span.attributes_number[SpanAttributeKey.STEP_ID]) for span in steps] == [
         ("system-1", timestamp, 1),
         ("user-2", timestamp, 2),
     ]
+    assert '"nemo.step_id":1.0' in (Span.from_domain(steps[0]).raw_attributes or "")
 
 
 def test_atif_mapping_uses_root_final_metrics_when_steps_have_no_metrics() -> None:
@@ -580,11 +582,11 @@ def test_atif_mapping_uses_root_final_metrics_when_steps_have_no_metrics() -> No
         }
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
 
     root_response = Span.from_domain(spans[0])
     child_response = Span.from_domain(
@@ -622,11 +624,11 @@ def test_atif_mapping_does_not_duplicate_final_metrics_when_step_metrics_exist()
         }
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
 
     root_response = Span.from_domain(spans[0])
     child_response = Span.from_domain(
@@ -665,11 +667,11 @@ def test_atif_mapping_uses_root_cost_when_step_metrics_have_tokens_only() -> Non
         }
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
 
     root_response = Span.from_domain(spans[0])
     child_response = Span.from_domain(
@@ -712,11 +714,11 @@ def test_atif_mapping_keeps_tool_error_on_tool_span() -> None:
         }
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
 
     root = spans[0]
     llm = next(span for span in spans if span.kind == SpanKind.LLM)
@@ -756,11 +758,11 @@ def test_atif_mapping_does_not_treat_returned_content_as_tool_error(tool_name: s
         }
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
 
     tool = next(span for span in spans if span.kind == SpanKind.TOOL)
     assert tool.status == SpanStatus.SUCCESS
@@ -785,11 +787,11 @@ def test_atif_mapping_respects_explicit_success_over_error_text() -> None:
         }
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
 
     tool = next(span for span in spans if span.kind == SpanKind.TOOL)
     assert tool.status == SpanStatus.SUCCESS
@@ -842,11 +844,11 @@ def test_atif_mapping_tool_result_error_metadata_and_fallback(
             ],
         }
     )
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
     tool = next(span for span in spans if span.kind == SpanKind.TOOL)
     assert tool.status == expected_status
     response = Span.from_domain(tool)
@@ -889,11 +891,11 @@ def test_atif_mapping_error_metadata_matches_only_its_tool_call(is_error: bool) 
             ],
         }
     )
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
     statuses = {span.name: span.status for span in spans if span.kind == SpanKind.TOOL}
     assert statuses == {
         "read": SpanStatus.ERROR if is_error else SpanStatus.SUCCESS,
@@ -920,11 +922,11 @@ def test_atif_mapping_promotes_root_extra_error() -> None:
         }
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
 
     root = spans[0]
     root_response = Span.from_domain(root)
@@ -951,11 +953,11 @@ def test_atif_mapping_ignores_non_object_root_extra_error(error: Any) -> None:
         }
     )
 
-    root = trajectory_to_spans(
+    root = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )[0]
+    ).spans[0]
 
     assert root.status == SpanStatus.SUCCESS
 
@@ -977,14 +979,18 @@ def test_atif_mapping_span_ids_are_trace_native_and_ignore_evaluation_run_id() -
     ingested_at = datetime(2026, 5, 18, tzinfo=timezone.utc)
     first_ids = {
         span.name: span.external_span_id
-        for span in trajectory_to_spans(workspace="default", trajectory=first, ingested_at=ingested_at)
+        for span in atif_trace_batch(workspace="default", trajectory=first, ingested_at=ingested_at).spans
     }
     second_ids = {
         span.name: span.external_span_id
-        for span in trajectory_to_spans(workspace="default", trajectory=second, ingested_at=ingested_at)
+        for span in atif_trace_batch(workspace="default", trajectory=second, ingested_at=ingested_at).spans
     }
 
     assert first_ids == second_ids
+    assert first_ids == {
+        "sample-agent": "span-f3e24ec1d6b9c1ac8cdd804f7b419b71",
+        "user-1": "span-d082e117595584d2163dad420d0950b5",
+    }
 
 
 def _timed_trajectory(steps: list[dict[str, Any]], extra: dict[str, Any] | None = None) -> AtifTrajectory:
@@ -1027,11 +1033,11 @@ def test_atif_v17_tool_call_extra_is_accepted_and_preserved() -> None:
     assert extra is not None
     assert extra["ancestry"]["function_name"] == "searcher"
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
     tool = next(span for span in spans if span.name == "search")
     assert json.loads(tool.input)["extra"]["invocation"]["end_timestamp"] == 101.5
 
@@ -1066,11 +1072,11 @@ def test_atif_mapping_uses_invocation_timing_for_step_and_tool_spans() -> None:
         ]
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
     root = next(span for span in spans if span.name == "sample-agent")
     step = next(span for span in spans if span.name == "sample-agent" and span.kind == SpanKind.LLM)
     tool = next(span for span in spans if span.name == "bash")
@@ -1107,11 +1113,11 @@ def test_atif_mapping_root_covers_tool_call_only_invocation_timing() -> None:
         ]
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=base + timedelta(seconds=15),
-    )
+    ).spans
     root = next(span for span in spans if span.name == "sample-agent")
 
     assert root.start_time == base + timedelta(seconds=10)
@@ -1136,11 +1142,11 @@ def test_atif_mapping_drops_root_end_time_before_root_start_time() -> None:
         ]
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=base,
-    )
+    ).spans
     root = next(span for span in spans if span.name == "sample-agent")
 
     assert root.start_time == base + timedelta(seconds=10)
@@ -1168,11 +1174,11 @@ def test_atif_mapping_does_not_infer_step_or_tool_ends() -> None:
         },
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
     user = next(span for span in spans if span.name == "user-1")
     step = next(span for span in spans if span.name == "sample-agent" and span.kind == SpanKind.LLM)
     tool = next(span for span in spans if span.name == "bash")
@@ -1213,11 +1219,11 @@ def test_atif_mapping_leaves_end_time_none_when_underivable() -> None:
         ]
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
     user = next(span for span in spans if span.name == "user-1")
     tool = next(span for span in spans if span.name == "bash")
     llm_steps = [span for span in spans if span.name == "sample-agent" and span.kind == SpanKind.LLM]
@@ -1260,11 +1266,11 @@ def test_atif_mapping_tool_end_requires_explicit_tool_invocation_end() -> None:
         ]
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=base,
-    )
+    ).spans
     step = next(span for span in spans if span.name == "sample-agent" and span.kind == SpanKind.LLM)
     tool = next(span for span in spans if span.name == "bash")
 
@@ -1286,11 +1292,11 @@ def test_atif_mapping_end_time_none_when_no_timing_exists_at_all() -> None:
         ]
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
     assert all(
         span.end_time is None
         for span in spans
@@ -1349,11 +1355,11 @@ def test_atif_v17_observation_on_nested_system_step() -> None:
 
     # Map the whole tree. The nested system step is emitted as its own span;
     # previously the entire POST 422'd before any span could be stored.
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
-    )
+    ).spans
     system_span = next((s for s in spans if s.name == "system-1"), None)
     assert system_span is not None, "nested system step should map to a span"
 
@@ -1377,13 +1383,26 @@ def test_atif_mapping_stamps_agent_name_on_every_span() -> None:
         steps=[AtifStepUser(step_id=1, source="user", message="solve")],
     )
 
-    spans = trajectory_to_spans(
+    spans = atif_trace_batch(
         workspace="default",
         trajectory=trajectory,
         ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
-    )
+    ).spans
 
     # Not just the root, so agent-scoped span queries work too.
     assert spans
     for span in spans:
         assert span.attributes_string["gen_ai.agent.name"] == "sample-agent"
+        assert span.attributes_string["agent.version"] == "1.0.0"
+
+
+def test_atif_mapping_is_not_bound_by_direct_span_ingest_limits() -> None:
+    trajectory = AtifTrajectory(session_id="", agent=AtifAgent(name="a" * 1025, version="1.0.0"))
+
+    spans = atif_trace_batch(
+        workspace="default",
+        trajectory=trajectory,
+        ingested_at=datetime(2026, 5, 18, tzinfo=timezone.utc),
+    ).spans
+
+    assert [(span.session_id, span.name) for span in spans] == [("", "a" * 1025)]

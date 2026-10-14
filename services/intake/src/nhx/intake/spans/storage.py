@@ -34,10 +34,6 @@ def stable_id(*parts: str, prefix: str | None = None) -> str:
     return f"{prefix}-{digest[:32]}" if prefix else digest[:32]
 
 
-def json_dumps(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
 def json_dumps_preserve(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 

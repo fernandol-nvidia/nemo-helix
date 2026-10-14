@@ -9,6 +9,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Self
 
+from nemo_helix_plugin.intake.types import EvaluationContext
 from nhx.common.entities.values import DatetimeFilter
 from nhx.intake.spans.domain import (
     INTAKE_PREVIEW_PAYLOAD_CHAR_LIMIT,
@@ -16,7 +17,6 @@ from nhx.intake.spans.domain import (
     IntakeTrace,
     SpanStatus,
 )
-from nhx.intake.spans.ingest.evaluation_context import EvaluationContext
 from nhx.intake.spans.storage import text_for_mode
 from pydantic import BaseModel, Field
 

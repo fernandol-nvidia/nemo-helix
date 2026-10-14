@@ -17,11 +17,11 @@ from enum import Enum
 from typing import Annotated, Any, Self
 
 from fastapi import APIRouter, Depends, status
+from nemo_helix_plugin.intake.types import EvaluationContext
 from nhx.common.entities.client import EntityClient
 from nhx.common.service.dependencies import get_entity_client
 from nhx.intake.spans.api.dependencies import DenormalizerDep, SpansServiceDep, require_workspace_access
 from nhx.intake.spans.domain import IntakeSpan, SpanKind, SpanStatus, TraceBatch
-from nhx.intake.spans.ingest.evaluation_context import EvaluationContext
 from nhx.intake.spans.ingest.evaluation_context_validation import validate_evaluation_context
 from nhx.intake.spans.span_attribute_bags import SpanAttributeBags
 from nhx.intake.spans.span_semantic_attributes import SpanSemanticAttributes

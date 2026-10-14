@@ -368,6 +368,8 @@ def test_atif_ingest_expands_embedded_subagent_trajectory_into_the_parent_trace(
     assert worker_step["agent_name"] == "worker-agent"
     assert root["started_at"] == _span_started_at(root_started_at)
     assert root["ended_at"] == _span_ended_at(subagent_ended_at)
+    # Embedded subagent spans record when Intake ingested them, not when their delegating step started.
+    assert len({span["ingested_at"] for span in spans}) == 1
 
 
 def test_atif_ingest_rejects_subagent_tree_over_configured_depth(shallow_atif_client: TestClient):

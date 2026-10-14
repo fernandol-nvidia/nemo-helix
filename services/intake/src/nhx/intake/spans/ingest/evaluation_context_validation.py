@@ -4,9 +4,9 @@
 """Validation helpers for evaluation-scoped ingest."""
 
 from fastapi import HTTPException, status
+from nemo_helix_plugin.intake.types import EvaluationContext
 from nhx.common.entities.client import EntityClient, EntityNotFoundError
 from nhx.intake.entities.experiments import Experiment
-from nhx.intake.spans.ingest.evaluation_context import EvaluationContext
 
 
 async def validate_evaluation_context(

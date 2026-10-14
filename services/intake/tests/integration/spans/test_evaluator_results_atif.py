@@ -59,12 +59,13 @@ def test_atif_ingest_emits_one_row_per_reward_key(client: TestClient):
     listed = client.get(EVAL_BASE, params={"page_size": 50})
     assert listed.status_code == 200, listed.text
     rows = listed.json()["data"]
-    # One row per reward key; namespaced keys (v1/quality) pass through verbatim.
+    # One row per reward key, each with its own id; namespaced keys (v1/quality) pass through verbatim.
     assert {row["name"]: row["value"] for row in rows} == {
         "correctness": 0.75,
         "structure": 1.0,
         "v1/quality": 0.5,
     }
+    assert len({row["evaluator_result_id"] for row in rows}) == 3
 
 
 def test_atif_re_ingest_dedupes_per_reward(client: TestClient):

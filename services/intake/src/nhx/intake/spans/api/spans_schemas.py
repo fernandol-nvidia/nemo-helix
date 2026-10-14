@@ -10,6 +10,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Self
 
+from nemo_helix_plugin.intake.types import SpanEvaluationContext as _SpanEvaluationContext
 from nhx.common.api.common import Page
 from nhx.common.entities.values import DatetimeFilter
 from nhx.intake.spans.domain import (
@@ -20,11 +21,10 @@ from nhx.intake.spans.domain import (
     SpanStatus,
 )
 from nhx.intake.spans.domain import SpanGroup as IntakeSpanGroup
-from nhx.intake.spans.ingest.evaluation_context import EvaluationContext
 from nhx.intake.spans.span_attribute_bags import SpanAttributeBags
 from nhx.intake.spans.span_semantic_attributes import SpanSemanticAttributes
 from nhx.intake.spans.storage import text_for_mode
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 class SpanSortField(StrEnum):
@@ -82,10 +82,7 @@ class SpanFilter(BaseModel):
     started_at: DatetimeFilter | None = Field(default=None, description="Filter by span start timestamp.")
 
 
-class SpanEvaluationContext(EvaluationContext):
-    # Read model for span evaluation context, aligned with the ingest EvaluationContext.
-    model_config = ConfigDict(extra="forbid")
-
+class SpanEvaluationContext(_SpanEvaluationContext):
     @classmethod
     def from_semantic_attributes(cls, attributes: SpanSemanticAttributes) -> Self | None:
         context = cls(
