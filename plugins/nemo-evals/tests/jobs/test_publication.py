@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -54,10 +54,11 @@ from nemo_evals.shared.metric_bundles.hybrid import HybridMetricBundlePackager
 from nemo_helix_plugin.client.errors import NemoTransportError, NotFoundError
 from nemo_helix_plugin.intake.client import AsyncIntakeClient
 from nemo_helix_plugin.intake.types import (
-    AtifCreateRequest,
+    DirectSpanInput,
+    DirectSpansIngestRequest,
     EvaluationPatchRequest,
     EvaluatorResultCreateRequest,
-    ListTracesQueryParams,
+    SpanAttributeKey,
 )
 from nemo_helix_plugin.job_context import JobContext, StoragePaths
 from nemo_helix_plugin.job_results import LocalJobResults
@@ -85,9 +86,6 @@ _INLINE_METRIC = MetricInline.model_validate(
     ).model_dump(mode="json")
 )
 
-#: Aliased because `_FakeTraces` defines a `list` method, which shadows the builtin in class scope.
-_SessionIds = list[str]
-
 
 def _response(status: int) -> httpx.Response:
     """A real httpx response; typed client errors read ``response.request`` in their constructor."""
@@ -95,20 +93,6 @@ def _response(status: int) -> httpx.Response:
 
 
 # --- fakes ------------------------------------------------------------------
-
-
-class _FakeTraces:
-    def __init__(self, calls: _SessionIds) -> None:
-        self._calls = calls
-
-    def list(self, *, workspace: str, filter: dict[str, Any]) -> AsyncIterator[object]:  # noqa: A002
-        session_id = filter["session_id"]
-        self._calls.append(session_id)
-
-        async def _gen() -> AsyncIterator[object]:
-            yield SimpleNamespace(session_id=session_id, root_span_id=f"span:{session_id}")
-
-        return _gen()
 
 
 class _FakeEvaluations:
@@ -122,7 +106,7 @@ class _FakeEvaluations:
         self.missing = missing
         self.error = error
         self.patch_error = patch_error
-        self.retrieved: _SessionIds = []
+        self.retrieved: list[str] = []
         self.patched: list[dict[str, Any]] = []
         self.metadata: dict[str, str] = {"eval_config_fileset": "fs-1"}
 
@@ -157,14 +141,6 @@ class _FakeIngest:
         self._calls.append(kwargs)
 
 
-class _FakePaginatedResponse:
-    def __init__(self, items: AsyncIterator[object]) -> None:
-        self._items = items
-
-    def items(self) -> AsyncIterator[object]:
-        return self._items
-
-
 class _FakeClient(AsyncIntakeClient):
     """Minimal stand-in for the typed Intake client publication touches."""
 
@@ -179,15 +155,13 @@ class _FakeClient(AsyncIntakeClient):
     ) -> None:
         self._workspace = "default"
         self._http = httpx.AsyncClient()
-        self.atif_calls: list[dict[str, Any]] = []
+        self.span_calls: list[dict[str, Any]] = []
         self.eval_result_calls: list[dict[str, Any]] = []
-        self.trace_calls: _SessionIds = []
         self.with_http_client_calls = 0
         self.evaluations = _FakeEvaluations(missing=missing_evaluation, error=preflight_error, patch_error=patch_error)
         self._intake = SimpleNamespace(
-            ingest=SimpleNamespace(atif=_FakeIngest(self.atif_calls, error=ingest_error, delay_sec=ingest_delay_sec)),
+            ingest=SimpleNamespace(spans=_FakeIngest(self.span_calls, error=ingest_error, delay_sec=ingest_delay_sec)),
             evaluator_results=_FakeIngest(self.eval_result_calls),
-            traces=_FakeTraces(self.trace_calls),
         )
 
     @property
@@ -213,11 +187,20 @@ class _FakeClient(AsyncIntakeClient):
         )
         return SimpleNamespace(data=lambda: result)
 
-    async def create_atif(self, *, workspace: str | None = None, body: AtifCreateRequest) -> object:
-        payload = dict(body.root)
-        payload["workspace"] = workspace or self.workspace
-        await self.intake.ingest.atif.create(**payload)
+    async def create_spans(self, *, workspace: str | None = None, body: DirectSpansIngestRequest) -> object:
+        await self.intake.ingest.spans.create(workspace=workspace or self.workspace, spans=list(body.spans))
         return SimpleNamespace(data=lambda: None)
+
+    @property
+    def published_root(self) -> DirectSpanInput:
+        """The trace root, which publication sends last."""
+        (root,) = self.span_calls[-1]["spans"]
+        return root
+
+    @property
+    def first_published_step(self) -> DirectSpanInput:
+        steps = [span for call in self.span_calls for span in call["spans"] if span.parent_span_id is not None]
+        return min(steps, key=lambda span: span.attributes[SpanAttributeKey.STEP_ID])
 
     async def create_evaluator_result(
         self, *, workspace: str | None = None, body: EvaluatorResultCreateRequest
@@ -226,16 +209,6 @@ class _FakeClient(AsyncIntakeClient):
         payload["workspace"] = workspace or self.workspace
         result = await self.intake.evaluator_results.create(**payload)
         return SimpleNamespace(data=lambda: result)
-
-    async def list_traces(
-        self, *, workspace: str | None = None, query_params: ListTracesQueryParams | None = None
-    ) -> _FakePaginatedResponse:
-        params = query_params or {}
-        return _FakePaginatedResponse(
-            self.intake.traces.list(
-                workspace=workspace or self.workspace or "", filter=dict(params.get("filter") or {})
-            )
-        )
 
 
 def _client(**kwargs: Any) -> _FakeClient:
@@ -478,7 +451,7 @@ def test_outcome_does_not_leak_experiment_id() -> None:
 def test_stamps_the_run_start_time_so_republish_is_idempotent() -> None:
     client = _FakeClient()
     _publish(client)
-    assert client.atif_calls[0]["steps"][0]["timestamp"] == STARTED_AT
+    assert client.first_published_step.started_at == STARTED_AT
 
 
 def test_missing_evaluation_fails_before_any_ingest() -> None:
@@ -486,7 +459,7 @@ def test_missing_evaluation_fails_before_any_ingest() -> None:
     with pytest.raises(PublicationFailedError) as excinfo:
         _publish(client)
 
-    assert client.atif_calls == []
+    assert client.span_calls == []
     outcome = excinfo.value.outcome
     assert outcome.status == HelixJobStatus.ERROR
     assert "does not exist" in (outcome.error or "")
@@ -628,7 +601,7 @@ def test_job_does_not_publish_without_a_publication_spec(tmp_path: Path, mocker:
     result = AsyncAgentEvalJob().run(spec.model_dump(), ctx=_job_context(tmp_path), async_client=client)
 
     assert "publication" not in result
-    assert client.atif_calls == []
+    assert client.span_calls == []
 
 
 def test_job_publishes_through_the_real_sync_bridge(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -643,7 +616,7 @@ def test_job_publishes_through_the_real_sync_bridge(tmp_path: Path, mocker: Mock
     # reusing the same injected SDK. That crossing is what raises "Event loop is closed" when the
     # client is bound to a dead loop (cf. nhx-1hr.2). It does not distinguish `run_sync` from a bare
     # `asyncio.run` — no loop is running at this point, so both behave the same here.
-    ingest_loop = client.intake.ingest.atif.loop
+    ingest_loop = client.intake.ingest.spans.loop
     assert evaluator.loop is not None
     assert evaluator.loop.is_closed()
     assert ingest_loop is not None
@@ -657,7 +630,7 @@ def test_job_publishes_through_the_real_sync_bridge(tmp_path: Path, mocker: Mock
         "evaluator_result_count": 1,
         "skipped": [],
     }
-    assert len(client.atif_calls) == 1
+    assert client.published_root.session_id
 
 
 def test_job_keeps_the_bundle_when_required_publication_fails(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -755,7 +728,7 @@ def test_evaluate_job_does_not_publish_without_a_publication_spec(tmp_path: Path
     result = AsyncEvaluateJob().run(spec.model_dump(), ctx=_job_context(tmp_path, job_id="job-1"), async_client=client)
 
     assert "publication" not in result
-    assert client.atif_calls == []
+    assert client.span_calls == []
 
 
 def test_evaluate_job_persists_the_run_identity_it_published_under(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -775,9 +748,9 @@ def test_evaluate_job_persists_the_run_identity_it_published_under(tmp_path: Pat
 
     persisted = json.loads((ctx.storage.persistent / "artifacts" / "run-metadata.json").read_text())
     assert persisted["run_id"] == "job-1"
-    published_session = client.atif_calls[0]["session_id"]
+    published_session = client.published_root.session_id
     assert published_session.startswith(f"{persisted['run_id']}:")
-    assert client.atif_calls[0]["steps"][0]["timestamp"] == datetime.fromisoformat(persisted["started_at"])
+    assert client.first_published_step.started_at == datetime.fromisoformat(persisted["started_at"])
 
 
 def test_evaluate_job_publishes_rows_through_the_real_sync_bridge(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -795,7 +768,7 @@ def test_evaluate_job_publishes_rows_through_the_real_sync_bridge(tmp_path: Path
     # reusing the same injected SDK. That crossing is what raises "Event loop is closed" when the
     # client is bound to a dead loop. It does not distinguish `run_sync` from a bare `asyncio.run` —
     # no loop is running at this point, so both behave the same here.
-    ingest_loop = client.intake.ingest.atif.loop
+    ingest_loop = client.intake.ingest.spans.loop
     assert evaluator.loop is not None
     assert evaluator.loop.is_closed()
     assert ingest_loop is not None
@@ -803,10 +776,10 @@ def test_evaluate_job_publishes_rows_through_the_real_sync_bridge(tmp_path: Path
 
     assert result["publication"]["status"] == HelixJobStatus.COMPLETED
     assert result["publication"]["trial_count"] == 1
-    assert len(client.atif_calls) == 1
+    assert client.published_root.session_id
     # The run identity is the job id, so re-publishing the same job replaces rather than duplicates.
     # The trial half is the row content hash, stable across runs and dataset reorderings.
-    session_id = client.atif_calls[0]["session_id"]
+    session_id = client.published_root.session_id
     assert session_id.startswith("job-1:")
     assert len(session_id.removeprefix("job-1:")) == 64
 
@@ -821,8 +794,8 @@ def test_evaluate_job_uses_the_configured_test_case_id_column(tmp_path: Path, mo
         async_client=client,
     )
 
-    assert client.atif_calls[0]["session_id"] == "job-1:q-1"
-    assert client.atif_calls[0]["evaluation_context"]["test_case_name"] == "q-1"
+    assert client.published_root.session_id == "job-1:q-1"
+    assert client.published_root.attributes[SpanAttributeKey.TEST_CASE_NAME] == "q-1"
 
 
 def test_evaluate_job_without_a_job_id_cannot_publish(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -839,7 +812,7 @@ def test_evaluate_job_without_a_job_id_cannot_publish(tmp_path: Path, mocker: Mo
 
     assert result["publication"]["status"] == HelixJobStatus.ERROR
     assert "job id" in result["publication"]["error"]
-    assert client.atif_calls == []
+    assert client.span_calls == []
 
 
 def test_evaluate_job_reports_a_bad_test_case_id_column(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -854,7 +827,7 @@ def test_evaluate_job_reports_a_bad_test_case_id_column(tmp_path: Path, mocker: 
 
     assert result["publication"]["status"] == HelixJobStatus.ERROR
     assert "missing" in result["publication"]["error"]
-    assert client.atif_calls == []
+    assert client.span_calls == []
 
 
 def test_row_target_without_a_derivable_agent_name_is_rejected_at_submit() -> None:

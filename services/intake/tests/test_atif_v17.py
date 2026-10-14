@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from nemo_helix_plugin.intake.atif_domain import (
     AtifAgent,
+    AtifIngestRequest,
     AtifStepAgent,
     AtifStepUser,
     AtifSubagentTrajectoryRef,
@@ -19,7 +20,7 @@ from nemo_helix_plugin.intake.atif_mapping import AtifTrajectoryDepthError, _ste
 from nemo_helix_plugin.intake.types import EvaluationContext, SpanAttributeKey
 from nhx.intake.spans.api.spans_schemas import Span
 from nhx.intake.spans.domain import SpanKind, SpanStatus
-from nhx.intake.spans.ingest.atif import AtifIngestRequest, atif_trace_batch
+from nhx.intake.spans.ingest.atif import atif_trace_batch
 from nhx.intake.spans.span_attribute_bags import DIRECT_INGEST_RAW_ATTRIBUTES_KEY
 from pydantic import ValidationError
 

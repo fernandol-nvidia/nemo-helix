@@ -9,10 +9,11 @@ there is no feature flag — optionality is structural: you make the call or you
 don't, and the platform client is a required argument.
 
 It references an **existing** Experiment (created by the caller via the platform
-Experiments SDK) and never creates one. Per Trial it: POSTs the ATIF trajectory,
-resolves the trajectory's root span, then POSTs one evaluator-result per metric
-output. All request shapes come from :mod:`nemo_evals.intake.mapping`; the
-HTTP calls go through the typed Intake client.
+Experiments SDK) and never creates one. Per Trial it: maps the ATIF trajectory to
+spans with Intake's own mapping and POSTs them in bounded batches, root span last,
+then POSTs one evaluator-result per metric output against that root. All request
+shapes come from :mod:`nemo_evals.intake.mapping`; the HTTP calls go through the
+typed Intake client.
 """
 
 from __future__ import annotations
@@ -20,35 +21,42 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import timedelta
-from typing import cast
 
 from nemo_evals.intake import mapping
-from nemo_helix_plugin.client.errors import NotFoundError, UnprocessableEntityError
+from nemo_helix_plugin.client.errors import NotFoundError
+from nemo_helix_plugin.intake.atif_domain import AtifIngestRequest
+from nemo_helix_plugin.intake.atif_mapping import ATIF_SOURCE, AtifTrajectoryDepthError, trajectory_to_spans
 from nemo_helix_plugin.intake.client import AsyncIntakeClient
 from nemo_helix_plugin.intake.types import (
-    AtifCreateParams,
+    DIRECT_SPANS_MAX_BATCH_SIZE,
     AtifCreateRequest,
     AtifFinalMetricsParam,
     AtifStepParam,
+    DirectSpanInput,
+    DirectSpansIngestRequest,
     EvaluatorResultCreateRequest,
-    TraceFilterParam,
 )
 from nhx_evals_sdk.agent_eval.results import AgentEvalResult
 from nhx_evals_sdk.agent_eval.scores import AgentEvalTaskScore
 from nhx_evals_sdk.agent_eval.trials import AgentEvalTrial, TrialMeasurements
 from nhx_evals_sdk.metrics.utils import metric_type_name
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 logger = logging.getLogger(__name__)
 
 #: Default ceiling on concurrent per-trial publishes.
 DEFAULT_MAX_CONCURRENCY = 8
 
+#: Approximate JSON budget for one span-ingest request. Intake stores each request as one
+#: ClickHouse insert, so bounded requests keep the time and memory of every request flat however
+#: large the trajectory is. A span larger than the budget is sent on its own.
+SPAN_BATCH_MAX_BYTES = 8 * 1024 * 1024
+
 
 class PublishError(RuntimeError):
-    """Raised when one or more trials fail to publish (or a span never resolves).
+    """Raised when one or more trials fail to publish.
 
     Carries the partial :class:`PublishReport` of trials that *did* publish, so the
     caller can see what landed before re-running.
@@ -66,7 +74,7 @@ class PublishedTrial(BaseModel):
 
     trial_id: str = Field(description="Identifier of the published trial.")
     session_id: str = Field(description="Intake session id minted for the trajectory.")
-    span_id: str = Field(description="Resolved root AGENT span id the scores were attached to.")
+    span_id: str = Field(description="Root AGENT span id the scores were attached to.")
     evaluator_result_count: int = Field(description="Number of evaluator-result rows written for this trial.")
 
 
@@ -128,9 +136,30 @@ def _token_final_metrics(measurements: TrialMeasurements) -> AtifFinalMetricsPar
     return final_metrics or None
 
 
-def _atif_request_body(body: AtifCreateParams) -> AtifCreateParams:
-    """Return the ATIF JSON body, excluding generated-SDK-only path parameters."""
-    return cast(AtifCreateParams, {key: value for key, value in body.items() if key != "workspace"})
+def _span_batches(spans: Sequence[DirectSpanInput]) -> Iterator[list[DirectSpanInput]]:
+    """Group spans into span-ingest requests within the span-count and byte budgets."""
+    batch: list[DirectSpanInput] = []
+    batch_size = 0
+    for span in spans:
+        span_size = len(span.model_dump_json(exclude_unset=True))
+        if batch and (len(batch) == DIRECT_SPANS_MAX_BATCH_SIZE or batch_size + span_size > SPAN_BATCH_MAX_BYTES):
+            yield batch
+            batch, batch_size = [], 0
+        batch.append(span)
+        batch_size += span_size
+    if batch:
+        yield batch
+
+
+async def _ingest_trace_spans(intake: AsyncIntakeClient, *, workspace: str, spans: Sequence[DirectSpanInput]) -> None:
+    """Send one trace's spans in bounded requests, its root span last.
+
+    Traces are listed by their root span, so a publish that fails part-way lists no partial trace,
+    and publishing again writes the same span identities, which Intake replaces.
+    """
+    root, *children = spans
+    for batch in [*_span_batches(children), [root]]:
+        await intake.create_spans(workspace=workspace, body=DirectSpansIngestRequest(source=ATIF_SOURCE, spans=batch))
 
 
 def _evaluator_result_request_body(row: mapping.EvaluatorResultCreateParams) -> EvaluatorResultCreateRequest:
@@ -170,10 +199,10 @@ async def publish_to_intake(
     a worker retry after a partial publish safe.
 
     ``experiment_id`` must reference an evaluation that already exists and is not
-    deleted; it is checked once up front. ATIF ingest enforces this server-side, but
-    OTLP ingest does not, so nothing else would stop the primary path from writing
-    spans against an evaluation that cannot hold them. Creating the evaluation is a
-    separate, caller-side step via the platform Experiments SDK.
+    deleted; it is checked once up front. Span and OTLP ingest do not check it, so
+    nothing else would stop either path from writing spans against an evaluation that
+    cannot hold them. Creating the evaluation is a separate, caller-side step via the
+    platform Experiments SDK.
 
     Agent identity (``agent_name``/``agent_version``/``model_name``) is taken as
     arguments because it lives on the run *target*, which ``AgentEvalResult`` does
@@ -237,15 +266,15 @@ async def publish_to_intake(
             )
         return span_id
 
-    async def _publish_atif(trial: AgentEvalTrial, *, measurements: TrialMeasurements, session_id: str) -> str:
-        """Publish the trial's ATIF trajectory and return the root span id Intake minted for it."""
+    async def _publish_atif(trial: AgentEvalTrial, *, measurements: TrialMeasurements) -> str:
+        """Publish the trial's ATIF trajectory as span batches and return its root span id."""
         # A recorded runtime gives the trajectory a real end so Intake's latency rollup sees the
         # trial's wall-clock duration instead of 0; absent → no window, latency stays unmeasured.
         ended_at = (
             started_at + timedelta(seconds=measurements.runtime_sec) if measurements.runtime_sec is not None else None
         )
 
-        def build_body(steps: Sequence[AtifStepParam] | None) -> AtifCreateParams:
+        def build_spans(steps: Sequence[AtifStepParam] | None) -> list[DirectSpanInput]:
             body = mapping.trial_to_atif_ingest(
                 trial,
                 run_id=result.run_id,
@@ -258,36 +287,38 @@ async def publish_to_intake(
                 ended_at=ended_at,
                 steps=steps,
             )
-            body["workspace"] = resolved_workspace
-            return body
+            # Validate exactly the JSON ATIF ingest would receive, then map it with Intake's own mapping.
+            # The run start, not the publish clock, stamps spans without a timestamp, so re-publish replaces them.
+            request = AtifIngestRequest.model_validate_json(
+                AtifCreateRequest(root=body).model_dump_json(exclude_unset=True)
+            )
+            return trajectory_to_spans(
+                workspace=resolved_workspace,
+                trajectory=request.to_trajectory(),
+                ingested_at=started_at,
+            )
 
         recorded_steps = await mapping.atif_steps_from_trial(trial, started_at=started_at)
         try:
-            await intake.create_atif(
-                workspace=resolved_workspace,
-                body=AtifCreateRequest(root=_atif_request_body(build_body(recorded_steps))),
-            )
-        except UnprocessableEntityError as error:
+            spans = build_spans(recorded_steps)
+        except (ValidationError, AtifTrajectoryDepthError) as error:
             # The SDK's ATIF read model accepts shapes ingest does not, so a trajectory that
             # parsed locally can still be refused. Losing the trial's scores over a trace
             # detail is the wrong trade — fall back to the single-step trajectory a runner
             # with no trace would have sent. Guard on emptiness rather than ``is None``: with no
-            # steps to drop, the retry would resend the body ingest just refused.
+            # steps to drop, the retry would rebuild the trajectory ingest just refused.
             if not recorded_steps:
                 raise
             logger.warning(
-                "Intake rejected the recorded trajectory for trial %s (%s); publishing its final output instead.",
+                "ATIF ingest validation rejected the recorded trajectory for trial %s (%s); "
+                "publishing its final output instead.",
                 trial.id,
                 error,
             )
-            await intake.create_atif(
-                workspace=resolved_workspace,
-                body=AtifCreateRequest(root=_atif_request_body(build_body(None))),
-            )
+            spans = build_spans(None)
 
-        # ATIF span ids are minted by Intake from its own identity scheme, so unlike the
-        # OTLP path this one has to read the id back rather than know it locally.
-        return await _resolve_root_span_id(intake, workspace=resolved_workspace, session_id=session_id)
+        await _ingest_trace_spans(intake, workspace=resolved_workspace, spans=spans)
+        return spans[0].span_id
 
     async def _publish_trial(trial: AgentEvalTrial) -> PublishedTrial:
         async with semaphore:
@@ -295,7 +326,7 @@ async def publish_to_intake(
             session_id = mapping.session_id_for(result.run_id, trial.id)
             span_id = await _publish_otlp(trial, measurements=measurements, session_id=session_id)
             if span_id is None:
-                span_id = await _publish_atif(trial, measurements=measurements, session_id=session_id)
+                span_id = await _publish_atif(trial, measurements=measurements)
             return await _publish_scores(trial, session_id=session_id, span_id=span_id)
 
     async def _publish_scores(trial: AgentEvalTrial, *, session_id: str, span_id: str) -> PublishedTrial:
@@ -365,13 +396,3 @@ def _publish_failure_message(
         f"publish_to_intake(result, ...) once the issue is resolved to publish the rest.\n"
         f"Failed trials:\n  {detail}"
     )
-
-
-async def _resolve_root_span_id(intake: AsyncIntakeClient, *, workspace: str, session_id: str) -> str:
-    """Return the root AGENT span id for a freshly-ingested trajectory (design §3.5, option 1)."""
-    trace_filter: TraceFilterParam = {"session_id": session_id}
-    traces = await intake.list_traces(workspace=workspace, query_params={"filter": trace_filter})
-    async for trace in traces.items():
-        if trace.root_span_id:
-            return trace.root_span_id
-    raise PublishError(f"No root span resolved for session {session_id!r} after ATIF ingest")

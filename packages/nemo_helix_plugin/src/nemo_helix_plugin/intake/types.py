@@ -765,13 +765,17 @@ class DirectSpanInput(BaseModel):
     attributes: dict[str, JsonValue] = Field(default_factory=dict)
 
 
+DIRECT_SPANS_MAX_BATCH_SIZE = 1000
+"""Most spans one POST /ingest/spans request accepts."""
+
+
 class DirectSpansIngestRequest(BaseModel):
     """Request body for POST /ingest/spans."""
 
     model_config = ConfigDict(extra="forbid")
 
     source: str = Field(description="Stable name for the source trace store, such as `langsmith` or `mlflow`.")
-    spans: list[DirectSpanInput] = Field(min_length=1, max_length=1000)
+    spans: list[DirectSpanInput] = Field(min_length=1, max_length=DIRECT_SPANS_MAX_BATCH_SIZE)
 
 
 class ExperimentFilterParam(TypedDict, total=False):

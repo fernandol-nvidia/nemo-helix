@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import AsyncIterable, AsyncIterator, Iterable
+from collections.abc import AsyncIterable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,14 +15,16 @@ from typing import Any
 
 import httpx
 import pytest
+from nemo_evals.intake import publish
 from nemo_evals.intake.publish import PublishError, _token_final_metrics, publish_to_intake
-from nemo_helix_plugin.client.errors import NotFoundError, UnprocessableEntityError
+from nemo_helix_plugin.client.errors import NotFoundError
 from nemo_helix_plugin.intake.client import AsyncIntakeClient
 from nemo_helix_plugin.intake.types import (
-    AtifCreateRequest,
+    DirectSpanInput,
+    DirectSpansIngestRequest,
     EvaluatorResultCreateRequest,
     IngestResponse,
-    ListTracesQueryParams,
+    SpanAttributeKey,
 )
 from nhx_evals_sdk.agent_eval.results import AgentEvalResult, AgentEvalSummary, RunMetadata
 from nhx_evals_sdk.agent_eval.scores import AgentEvalScoreStatus, AgentEvalTaskScore
@@ -40,14 +42,14 @@ from pydantic import ValidationError
 # --- fakes ------------------------------------------------------------------
 
 
-class _FakeAtif:
+class _FakeSpans:
     def __init__(self, calls: list[dict[str, Any]], *, fail: bool = False) -> None:
         self._calls = calls
         self._fail = fail
 
     async def create(self, **kwargs: Any) -> None:
         if self._fail:
-            raise RuntimeError("atif ingest 400")
+            raise RuntimeError("span ingest 400")
         self._calls.append(kwargs)
 
 
@@ -73,23 +75,6 @@ class _FakeEvaluatorResults:
         return SimpleNamespace(evaluator_result_id="eval-1")
 
 
-class _FakeTraces:
-    """Returns one root-span trace per requested session id (or none, to test resolution failure)."""
-
-    def __init__(self, *, root_span_id: str | None) -> None:
-        self._root_span_id = root_span_id
-
-    def list(self, *, workspace: str, filter: dict[str, Any]) -> AsyncIterator[object]:  # noqa: A002
-        root_span_id = self._root_span_id
-        session_id = filter["session_id"]
-
-        async def _gen() -> AsyncIterator[object]:
-            if root_span_id is not None:
-                yield SimpleNamespace(session_id=session_id, root_span_id=f"{root_span_id}:{session_id}")
-
-        return _gen()
-
-
 class _FakeEvaluations:
     """Resolves the run's evaluation, or 404s the way ingest does for a missing or deleted one."""
 
@@ -106,41 +91,28 @@ class _FakeEvaluations:
         return SimpleNamespace(data=lambda: SimpleNamespace(name=name))
 
 
-class _FakePaginatedResponse:
-    def __init__(self, items: AsyncIterator[object]) -> None:
-        self._items = items
-
-    def items(self) -> AsyncIterator[object]:
-        return self._items
-
-
 class _FakeClient(AsyncIntakeClient):
     def __init__(
         self,
         *,
         workspace: str | None = "default",
-        root_span_id: str | None = "span",
-        atif_fail: bool = False,
+        spans_fail: bool = False,
         fail_eval_session: str | None = None,
-        atif: Any | None = None,
         otlp_errors: list[str] | None = None,
         evaluation_missing: bool = False,
     ) -> None:
         self._workspace = workspace
         self.evaluation_calls: list[dict[str, Any]] = []
         self._evaluations = _FakeEvaluations(self.evaluation_calls, missing=evaluation_missing)
-        self.atif_calls: list[dict[str, Any]] = []
+        self.span_calls: list[dict[str, Any]] = []
         self.otlp_calls: list[dict[str, Any]] = []
         self.eval_calls: list[dict[str, Any]] = []
-        self._atif = atif or _FakeAtif(self.atif_calls, fail=atif_fail)
+        self._spans = _FakeSpans(self.span_calls, fail=spans_fail)
         self._otlp_traces = _FakeOtlpTraces(self.otlp_calls, errors=otlp_errors)
         self._evaluator_results = _FakeEvaluatorResults(self.eval_calls, fail_session=fail_eval_session)
-        self._traces = _FakeTraces(root_span_id=root_span_id)
 
-    async def create_atif(self, *, workspace: str | None = None, body: AtifCreateRequest) -> object:
-        payload = dict(body.root)
-        payload["workspace"] = workspace or self.workspace
-        await self._atif.create(**payload)
+    async def create_spans(self, *, workspace: str | None = None, body: DirectSpansIngestRequest) -> object:
+        await self._spans.create(workspace=workspace or self.workspace, source=body.source, spans=list(body.spans))
         return SimpleNamespace(data=lambda: None)
 
     async def create_otlp_traces(
@@ -159,20 +131,21 @@ class _FakeClient(AsyncIntakeClient):
         result = await self._evaluator_results.create(**payload)
         return SimpleNamespace(data=lambda: result)
 
-    async def list_traces(
-        self, *, workspace: str | None = None, query_params: ListTracesQueryParams | None = None
-    ) -> _FakePaginatedResponse:
-        params = query_params or {}
-        return _FakePaginatedResponse(
-            self._traces.list(workspace=workspace or self.workspace or "", filter=dict(params.get("filter") or {}))
-        )
-
     async def get_evaluation(self, *, workspace: str | None = None, name: str) -> object:
         return await self._evaluations.get(name, workspace=workspace or self.workspace or "")
 
 
 def _client(**kwargs: Any) -> _FakeClient:
     return _FakeClient(**kwargs)
+
+
+def _published_spans(client: _FakeClient, session_id: str) -> list[DirectSpanInput]:
+    return [span for call in client.span_calls for span in call["spans"] if span.session_id == session_id]
+
+
+def _root(spans: list[DirectSpanInput]) -> DirectSpanInput:
+    (root,) = [span for span in spans if span.parent_span_id is None]
+    return root
 
 
 # --- fixtures ---------------------------------------------------------------
@@ -253,17 +226,15 @@ async def test_publishes_trajectory_and_scores() -> None:
     client = _FakeClient()
     report = await publish_to_intake(result, client=client, experiment_id="exp-1")
 
-    assert len(client.atif_calls) == 1
-    assert client.atif_calls[0]["session_id"] == "run-1:t-1"
-    assert client.atif_calls[0]["evaluation_context"] == {
-        "evaluation_name": "exp-1",
-        "test_case_name": "task-1",
-    }
+    assert {call["source"] for call in client.span_calls} == {"atif"}
+    root = _root(_published_spans(client, "run-1:t-1"))
+    assert root.attributes[SpanAttributeKey.EVALUATION_NAME] == "exp-1"
+    assert root.attributes[SpanAttributeKey.TEST_CASE_NAME] == "task-1"
     # 3 metric outputs across the two score records -> 3 evaluator-result rows.
     assert len(client.eval_calls) == 3
     assert {call["name"] for call in client.eval_calls} == {"accuracy.score", "accuracy.passed", "latency.p50"}
-    # span_id resolved from the trace and threaded into every row.
-    assert {call["span_id"] for call in client.eval_calls} == {"span:run-1:t-1"}
+    # The trajectory's root span is threaded into every row.
+    assert {call["span_id"] for call in client.eval_calls} == {root.span_id}
 
     assert report.trial_count == 1
     assert report.evaluator_result_count == 3
@@ -271,7 +242,7 @@ async def test_publishes_trajectory_and_scores() -> None:
     assert (published.trial_id, published.session_id, published.span_id, published.evaluator_result_count) == (
         "t-1",
         "run-1:t-1",
-        "span:run-1:t-1",
+        root.span_id,
         3,
     )
 
@@ -292,12 +263,12 @@ async def test_publish_revalidates_model_copy_corrupted_measurements_before_netw
         )
 
     assert client.evaluation_calls == []
-    assert (client.otlp_calls, client.atif_calls, client.eval_calls) == ([], [], [])
+    assert (client.otlp_calls, client.span_calls, client.eval_calls) == ([], [], [])
 
 
 async def test_an_unknown_evaluation_fails_the_run_before_any_trial_is_written() -> None:
-    # OTLP ingest does not check the evaluation exists the way ATIF ingest does, so without this
-    # guard the primary path would write spans against an evaluation that cannot hold them.
+    # Span and OTLP ingest do not check the evaluation exists, so without this guard either
+    # path would write spans against an evaluation that cannot hold them.
     result = _result(
         trials=[_trial("t-1")],
         scores=[_score("t-1", "accuracy", [MetricOutput(name="score", value=1.0)])],
@@ -308,7 +279,7 @@ async def test_an_unknown_evaluation_fails_the_run_before_any_trial_is_written()
         await publish_to_intake(result, client=client, experiment_id="exp-1")
 
     assert client.evaluation_calls == [{"name": "exp-1", "workspace": "default"}]
-    assert (client.otlp_calls, client.atif_calls, client.eval_calls) == ([], [], [])
+    assert (client.otlp_calls, client.span_calls, client.eval_calls) == ([], [], [])
 
 
 async def test_multiple_trials_each_get_their_own_session_and_span() -> None:
@@ -322,10 +293,12 @@ async def test_multiple_trials_each_get_their_own_session_and_span() -> None:
     client = _FakeClient()
     report = await publish_to_intake(result, client=client, experiment_id="exp-1")
 
-    assert len(client.atif_calls) == 2
     assert report.trial_count == 2
     by_session = {call["session_id"]: call["span_id"] for call in client.eval_calls}
-    assert by_session == {"run-1:t-1": "span:run-1:t-1", "run-1:t-2": "span:run-1:t-2"}
+    assert by_session == {
+        session_id: _root(_published_spans(client, session_id)).span_id for session_id in ("run-1:t-1", "run-1:t-2")
+    }
+    assert by_session["run-1:t-1"] != by_session["run-1:t-2"]
 
 
 async def test_trial_without_scores_still_ingests_trajectory() -> None:
@@ -333,7 +306,7 @@ async def test_trial_without_scores_still_ingests_trajectory() -> None:
     client = _FakeClient()
     report = await publish_to_intake(result, client=client, experiment_id="exp-1")
 
-    assert len(client.atif_calls) == 1
+    assert _root(_published_spans(client, "run-1:t-1")).span_id == report.published_trials[0].span_id
     assert len(client.eval_calls) == 0
     assert report.published_trials[0].evaluator_result_count == 0
 
@@ -343,7 +316,7 @@ async def test_explicit_workspace_overrides_client_default() -> None:
     client = _FakeClient(workspace="default")
     report = await publish_to_intake(result, client=client, experiment_id="exp-1", workspace="ws-2")
     assert report.workspace == "ws-2"
-    assert client.atif_calls[0]["workspace"] == "ws-2"
+    assert {call["workspace"] for call in client.span_calls} == {"ws-2"}
 
 
 async def test_missing_workspace_raises() -> None:
@@ -353,21 +326,46 @@ async def test_missing_workspace_raises() -> None:
         await publish_to_intake(result, client=client, experiment_id="exp-1")
 
 
-async def test_unresolvable_span_raises_publish_error() -> None:
-    result = _result(
-        trials=[_trial("t-1")],
-        scores=[_score("t-1", "accuracy", [MetricOutput(name="score", value=1.0)])],
-    )
-    client = _FakeClient(root_span_id=None)
-    with pytest.raises(PublishError, match="No root span"):
-        await publish_to_intake(result, client=client, experiment_id="exp-1")
-
-
 async def test_ingest_failure_propagates() -> None:
     result = _result(trials=[_trial("t-1")], scores=[])
-    client = _FakeClient(atif_fail=True)
-    with pytest.raises(RuntimeError, match="atif ingest 400"):
+    client = _FakeClient(spans_fail=True)
+    with pytest.raises(RuntimeError, match="span ingest 400"):
         await publish_to_intake(result, client=client, experiment_id="exp-1")
+
+
+async def test_the_root_span_is_sent_alone_after_every_other_span(tmp_path: Path) -> None:
+    # Traces are listed by their root span, so sending it last means a publish that fails
+    # part-way never lists a partial trace.
+    client = _client()
+
+    await publish_to_intake(_result([_trial_with_atif_trace(tmp_path)], []), client=client, experiment_id="exp-1")
+
+    spans = _published_spans(client, "run-1:t-1")
+    assert len(spans) > 1
+    assert client.span_calls[-1]["spans"] == [_root(spans)]
+
+
+async def test_span_requests_stay_within_the_count_and_byte_budgets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    steps = [
+        {"step_id": index, "source": "agent", "message": "x" * 400, "timestamp": "2026-01-01T00:00:00+00:00"}
+        for index in range(1, 9)
+    ]
+    trial = _trial_with_atif_trace(tmp_path, steps=steps)
+    monkeypatch.setattr(publish, "SPAN_BATCH_MAX_BYTES", 1500)
+    monkeypatch.setattr(publish, "DIRECT_SPANS_MAX_BATCH_SIZE", 3)
+    client = _client()
+
+    await publish_to_intake(_result([trial], []), client=client, experiment_id="exp-1")
+
+    batches = [call["spans"] for call in client.span_calls]
+    for batch in batches:
+        span_sizes = [len(span.model_dump_json(exclude_unset=True)) for span in batch]
+        assert len(batch) <= 3
+        assert len(batch) == 1 or sum(span_sizes) <= 1500
+    assert sum(len(batch) for batch in batches) == len(_published_spans(client, "run-1:t-1"))
+    assert len(batches) > 2
 
 
 async def test_failed_and_non_finite_scores_publish_as_failed_rows() -> None:
@@ -418,21 +416,9 @@ async def test_one_trial_failure_does_not_block_others_and_is_reported() -> None
     assert "re-run" in message or "cached" in message or "publish" in message
 
 
-class _RejectRichTrajectoryAtif:
-    """Ingest that refuses any multi-step trajectory, the way a schema mismatch would."""
-
-    def __init__(self, calls: list[dict[str, Any]]) -> None:
-        self._calls = calls
-
-    async def create(self, **kwargs: Any) -> None:
-        self._calls.append(kwargs)
-        if len(kwargs["steps"]) > 1:
-            raise UnprocessableEntityError(
-                httpx.Response(422, request=httpx.Request("POST", "http://test/atif")),
-            )
-
-
-def _trial_with_atif_trace(tmp_path: Path, trial_id: str = "t-1") -> AgentEvalTrial:
+def _trial_with_atif_trace(
+    tmp_path: Path, trial_id: str = "t-1", *, steps: list[dict[str, Any]] | None = None
+) -> AgentEvalTrial:
     trace = tmp_path / "trajectory.json"
     trace.write_text(
         json.dumps(
@@ -440,7 +426,8 @@ def _trial_with_atif_trace(tmp_path: Path, trial_id: str = "t-1") -> AgentEvalTr
                 "schema_version": "ATIF-v1.7",
                 "session_id": "s",
                 "agent": {"name": "codex", "version": "1.0"},
-                "steps": [
+                "steps": steps
+                or [
                     {"step_id": 1, "source": "user", "message": "q", "timestamp": "2026-01-01T00:00:00+00:00"},
                     {"step_id": 2, "source": "agent", "message": "a", "timestamp": "2026-01-01T00:00:01+00:00"},
                 ],
@@ -460,9 +447,19 @@ def _trial_with_atif_trace(tmp_path: Path, trial_id: str = "t-1") -> AgentEvalTr
 
 @pytest.mark.asyncio
 async def test_a_rejected_trajectory_falls_back_instead_of_failing_the_trial(tmp_path: Path) -> None:
-    calls: list[dict[str, Any]] = []
-    client = _client(atif=_RejectRichTrajectoryAtif(calls))
-    trial = _trial_with_atif_trace(tmp_path)
+    # The read model accepts an observation that cites no tool call; ingest validation does not.
+    steps = [
+        {"step_id": 1, "source": "user", "message": "q", "timestamp": "2026-01-01T00:00:00+00:00"},
+        {
+            "step_id": 2,
+            "source": "agent",
+            "message": "a",
+            "timestamp": "2026-01-01T00:00:01+00:00",
+            "observation": {"results": [{"source_call_id": "missing", "content": "x"}]},
+        },
+    ]
+    client = _client()
+    trial = _trial_with_atif_trace(tmp_path, steps=steps)
 
     report = await publish_to_intake(
         _result([trial], [_score("t-1", "m", [MetricOutput(name="score", value=1.0)])]),
@@ -471,8 +468,9 @@ async def test_a_rejected_trajectory_falls_back_instead_of_failing_the_trial(tmp
         workspace="ws-1",
     )
 
-    # The rich attempt is refused, the single-step retry lands, and the trial still publishes.
-    assert [len(call["steps"]) for call in calls] == [2, 1]
+    # The rich trajectory is refused before anything is sent; the single-step fallback lands instead.
+    spans = _published_spans(client, "run-1:t-1")
+    assert [span.attributes.get(SpanAttributeKey.STEP_ID) for span in spans if span.parent_span_id] == [1]
     assert report.trial_count == 1
 
 
@@ -504,7 +502,7 @@ async def test_a_trial_with_an_otlp_trace_publishes_otlp_and_skips_atif() -> Non
     )
 
     assert len(client.otlp_calls) == 1
-    assert client.atif_calls == [], "the OTLP trace is the trial's trajectory; ATIF must not also be sent"
+    assert client.span_calls == [], "the OTLP trace is the trial's trajectory; ATIF must not also be sent"
     assert client.otlp_calls[0]["workspace"] == "default"
     assert isinstance(client.otlp_calls[0]["body"], bytes)
     # The root span id comes off the payload, not from an Intake round trip.
@@ -546,7 +544,7 @@ async def test_a_trial_without_an_otlp_trace_still_publishes_atif() -> None:
     )
 
     assert client.otlp_calls == []
-    assert len(client.atif_calls) == 1
+    assert client.span_calls
 
 
 async def test_an_otlp_trace_with_no_single_root_falls_back_to_atif() -> None:
@@ -565,7 +563,7 @@ async def test_an_otlp_trace_with_no_single_root_falls_back_to_atif() -> None:
     )
 
     assert client.otlp_calls == []
-    assert len(client.atif_calls) == 1
+    assert client.span_calls
 
 
 async def test_trial_totals_land_on_the_root_span_only() -> None:
@@ -626,7 +624,7 @@ async def test_a_root_span_with_no_usable_id_falls_back_to_atif() -> None:
     )
 
     assert client.otlp_calls == []
-    assert len(client.atif_calls) == 1
+    assert client.span_calls
 
 
 async def test_a_span_without_a_start_time_is_given_the_runs() -> None:

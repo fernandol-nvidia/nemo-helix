@@ -174,10 +174,11 @@ both images. That is the quickest way to check the plumbing without spending tok
    `HarborRewardMetric`. The caller never imports `harbor`. `run_harbor_eval` is a one-call wrapper
    around exactly this.
 3. **Create the Experiment and Evaluation** — `publish_to_intake` references an Evaluation that
-   already exists and never creates one; ATIF ingest rejects an unknown name with HTTP 400. Both
+   already exists and never creates one; it rejects an unknown name before writing anything. Both
    creates pass `exist_ok=True`, so re-running is safe.
-4. **`publish_to_intake(result, ...)`** — per trial, posts the ATIF trajectory, resolves its root
-   span, and writes one evaluator-result row per metric output. Publishing is not atomic: every
+4. **`publish_to_intake(result, ...)`** — per trial, maps the ATIF trajectory to spans, posts them
+   in bounded batches with the root span last, and writes one evaluator-result row per metric
+   output against that root. Publishing is not atomic: every
    trial that can land does, and failures are raised together carrying a partial report rather
    than aborting on the first one. The script holds its result in memory only, so a publish that
    fails outright still means re-running the tasks. It is idempotent — the session id and row ids derive

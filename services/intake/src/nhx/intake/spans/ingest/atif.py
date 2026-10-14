@@ -6,19 +6,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from nemo_helix_plugin.intake.atif_domain import (
-    AtifAgent,
-    AtifFinalMetrics,
-    AtifSchemaVersion,
-    AtifStep,
+    AtifIngestRequest,
     AtifTrajectory,
-    validate_atif_step_ids,
-    validate_atif_subagent_trajectory_ids,
-    validate_atif_tool_call_references,
-    validate_atif_v17_subagent_ref_resolution_keys,
 )
 from nemo_helix_plugin.intake.atif_mapping import (
     ATIF_SOURCE,
@@ -27,7 +20,7 @@ from nemo_helix_plugin.intake.atif_mapping import (
     evaluator_rewards,
     trajectory_to_spans,
 )
-from nemo_helix_plugin.intake.types import DirectSpanInput, EvaluationContext
+from nemo_helix_plugin.intake.types import DirectSpanInput
 from nhx.common.entities.client import EntityClient
 from nhx.common.service.dependencies import get_entity_client
 from nhx.intake.config import IntakeConfig
@@ -36,7 +29,6 @@ from nhx.intake.spans.domain import EvaluatorResult, EvaluatorResultDataType, Tr
 from nhx.intake.spans.ingest.evaluation_context_validation import validate_evaluation_context
 from nhx.intake.spans.ingest.spans import direct_span_to_domain
 from nhx.intake.spans.storage import stable_id, utc_now
-from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 router = APIRouter(dependencies=[Depends(require_workspace_access)])
 API_TAG = "Ingest"
@@ -50,55 +42,6 @@ def _atif_max_subagent_depth(request: Request) -> int:
     if cfg is None:
         cfg = IntakeConfig()
     return cfg.atif_max_subagent_depth
-
-
-class AtifIngestRequest(BaseModel):
-    """Span-based ATIF ingest request.
-
-    ATIF project scoping is intentionally not accepted here; use the workspace
-    route and ``evaluation_context`` for evaluation identity.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    evaluation_context: EvaluationContext | None = None
-    schema_version: AtifSchemaVersion
-    session_id: str | None = None
-    trajectory_id: str | None = None
-    agent: AtifAgent
-    final_metrics: AtifFinalMetrics | None = None
-    continued_trajectory_ref: str | None = None
-    notes: str | None = None
-    extra: dict[str, Any] | None = None
-    steps: list[AtifStep] = Field(default_factory=list)
-    subagent_trajectories: list[AtifTrajectory] | None = None
-
-    @model_validator(mode="after")
-    def validate_steps(self) -> AtifIngestRequest:
-        """Validate step references and embedded subagent trajectory IDs."""
-        validate_atif_step_ids(self.steps)
-        validate_atif_tool_call_references(self.steps)
-        if self.schema_version == "ATIF-v1.7":
-            validate_atif_v17_subagent_ref_resolution_keys(self.steps)
-        validate_atif_subagent_trajectory_ids(self.subagent_trajectories)
-        return self
-
-    def to_trajectory(self) -> AtifTrajectory:
-        """Convert this API request into the recursive ATIF domain model."""
-        kwargs: dict[str, Any] = {} if self.session_id is None else {"session_id": self.session_id}
-        return AtifTrajectory(
-            schema_version=self.schema_version,
-            trajectory_id=self.trajectory_id,
-            agent=self.agent,
-            steps=self.steps,
-            final_metrics=self.final_metrics,
-            continued_trajectory_ref=self.continued_trajectory_ref,
-            notes=self.notes,
-            extra=self.extra,
-            subagent_trajectories=self.subagent_trajectories,
-            evaluation_context=self.evaluation_context,
-            **kwargs,
-        )
 
 
 @router.post(

@@ -10,8 +10,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Self
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from nemo_helix_plugin.intake.types import DIRECT_SPANS_MAX_BATCH_SIZE, SpanAttributeKey
 from nemo_helix_plugin.intake.types import DirectSpanInput as _DirectSpanInput
-from nemo_helix_plugin.intake.types import SpanAttributeKey
 from nhx.intake.config import DEFAULT_SPAN_RETENTION_DAYS
 from nhx.intake.spans.api.dependencies import DenormalizerDep, SpansServiceDep, require_workspace_access
 from nhx.intake.spans.domain import IntakeSpan, TraceBatch
@@ -77,7 +77,7 @@ class DirectSpansIngestRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source: SourceName
-    spans: list[DirectSpanInput] = Field(min_length=1, max_length=1000)
+    spans: list[DirectSpanInput] = Field(min_length=1, max_length=DIRECT_SPANS_MAX_BATCH_SIZE)
 
     @model_validator(mode="after")
     def reject_duplicate_span_identities(self) -> Self:
