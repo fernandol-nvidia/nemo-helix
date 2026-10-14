@@ -46,7 +46,9 @@ class ClickHouseSpanClient:
 
     def __init__(self, settings: ClickHouseSettings | None = None) -> None:
         self.settings = settings or ClickHouseSettings.from_config()
-        self._client: Any | None = None
+        # The native async driver binds each client to the event loop that opened it. The
+        # platform test harness runs lifespan tasks and requests on different loops.
+        self._clients: dict[asyncio.AbstractEventLoop, Any] = {}
         self._bootstrapped = False
         self._bootstrap_lock = asyncio.Lock()
 
@@ -103,16 +105,24 @@ class ClickHouseSpanClient:
         return await raw_client.insert(table, rows, column_names=column_names, database=self.database)
 
     async def close(self) -> None:
-        if self._client is not None:
-            await _close_client(self._client)
-            self._client = None
+        current_loop = asyncio.get_running_loop()
+        clients = list(self._clients.items())
+        self._clients.clear()
+        for loop, client in clients:
+            # A client whose loop is still running elsewhere can only be closed on that loop.
+            if loop is current_loop or loop.is_closed():
+                await _close_client(client)
 
     async def _get_raw_client(self) -> Any:
-        if self._client is None:
+        loop = asyncio.get_running_loop()
+        client = self._clients.get(loop)
+        if client is None:
             async with self._bootstrap_lock:
-                if self._client is None:
-                    self._client = await self._create_raw_client(database=self.database)
-        return self._client
+                client = self._clients.get(loop)
+                if client is None:
+                    client = await self._create_raw_client(database=self.database)
+                    self._clients[loop] = client
+        return client
 
     async def _create_raw_client(self, *, database: str) -> Any:
         clickhouse_connect = _import_clickhouse_connect()

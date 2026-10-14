@@ -18,6 +18,13 @@ from nhx.intake.spans.clickhouse_client import (
 )
 
 
+class _RawClient:
+    closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 class CountingClickHouseSpanClient(ClickHouseSpanClient):
     def __init__(self) -> None:
         super().__init__(
@@ -33,7 +40,7 @@ class CountingClickHouseSpanClient(ClickHouseSpanClient):
     async def _create_raw_client(self, *, database: str) -> Any:
         self.created += 1
         await asyncio.sleep(0)
-        return object()
+        return _RawClient()
 
 
 @pytest.mark.asyncio
@@ -44,6 +51,35 @@ async def test_get_raw_client_initializes_once_under_concurrency():
 
     assert client.created == 1
     assert len({id(raw_client) for raw_client in raw_clients}) == 1
+
+
+def test_get_raw_client_opens_one_client_per_event_loop():
+    client = CountingClickHouseSpanClient()
+
+    async def get_twice() -> tuple[Any, Any]:
+        return await client._get_raw_client(), await client._get_raw_client()
+
+    first, first_again = asyncio.run(get_twice())
+    second, _ = asyncio.run(get_twice())
+
+    assert first is first_again
+    assert second is not first
+    assert client.created == 2
+
+
+def test_close_releases_clients_opened_on_finished_loops():
+    client = CountingClickHouseSpanClient()
+    finished = asyncio.run(client._get_raw_client())
+
+    async def use_then_close() -> Any:
+        current = await client._get_raw_client()
+        await client.close()
+        return current
+
+    current = asyncio.run(use_then_close())
+
+    assert finished.closed
+    assert current.closed
 
 
 @pytest.mark.asyncio
