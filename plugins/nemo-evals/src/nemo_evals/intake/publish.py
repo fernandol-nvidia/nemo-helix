@@ -21,16 +21,23 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import timedelta
+from typing import cast, overload
 
 from nemo_evals.intake import mapping
 from nemo_helix_plugin.client.errors import NotFoundError
-from nemo_helix_plugin.intake.atif_domain import AtifIngestRequest
-from nemo_helix_plugin.intake.atif_mapping import ATIF_SOURCE, AtifTrajectoryDepthError, trajectory_to_spans
+from nemo_helix_plugin.intake.atif_domain import (
+    AtifIngestRequest,
+    AtifStep,
+    AtifTrajectory,
+    validate_atif_request_steps,
+)
+from nemo_helix_plugin.intake.atif_mapping import ATIF_SOURCE, iter_trajectory_spans
 from nemo_helix_plugin.intake.client import AsyncIntakeClient
 from nemo_helix_plugin.intake.types import (
     DIRECT_SPANS_MAX_BATCH_SIZE,
+    AtifCreateParams,
     AtifCreateRequest,
     AtifFinalMetricsParam,
     AtifStepParam,
@@ -42,7 +49,7 @@ from nhx_evals_sdk.agent_eval.results import AgentEvalResult
 from nhx_evals_sdk.agent_eval.scores import AgentEvalTaskScore
 from nhx_evals_sdk.agent_eval.trials import AgentEvalTrial, TrialMeasurements
 from nhx_evals_sdk.metrics.utils import metric_type_name
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +60,9 @@ DEFAULT_MAX_CONCURRENCY = 8
 #: ClickHouse insert, so bounded requests keep the time and memory of every request flat however
 #: large the trajectory is. A span larger than the budget is sent on its own.
 SPAN_BATCH_MAX_BYTES = 8 * 1024 * 1024
+
+_ATIF_STEP = TypeAdapter(AtifStep)
+_ATIF_STEP_PARAM = TypeAdapter(AtifStepParam)
 
 
 class PublishError(RuntimeError):
@@ -136,7 +146,41 @@ def _token_final_metrics(measurements: TrialMeasurements) -> AtifFinalMetricsPar
     return final_metrics or None
 
 
-def _span_batches(spans: Sequence[DirectSpanInput]) -> Iterator[list[DirectSpanInput]]:
+class _IngestSteps(Sequence[AtifStep]):
+    """A publish body's steps, each validated on access exactly as ATIF ingest would receive it.
+
+    Mapping reads the steps several times; validating on each access holds one step at a time, however long
+    the trajectory is.
+    """
+
+    def __init__(self, steps: Sequence[AtifStepParam]) -> None:
+        self._steps = steps
+
+    def __len__(self) -> int:
+        return len(self._steps)
+
+    @overload
+    def __getitem__(self, index: int) -> AtifStep: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[AtifStep]: ...
+
+    def __getitem__(self, index: int | slice) -> AtifStep | list[AtifStep]:
+        if isinstance(index, slice):
+            return [self[position] for position in range(*index.indices(len(self)))]
+        return _ATIF_STEP.validate_json(_ATIF_STEP_PARAM.dump_json(self._steps[index]))
+
+
+def _atif_trajectory(body: AtifCreateParams) -> AtifTrajectory:
+    """Validate a publish body exactly as ATIF ingest would, holding one step at a time."""
+    header = cast(AtifCreateParams, {key: value for key, value in body.items() if key != "steps"})
+    request = AtifIngestRequest.model_validate_json(AtifCreateRequest(root=header).model_dump_json(exclude_unset=True))
+    steps = _IngestSteps(body.get("steps", []))
+    validate_atif_request_steps(steps, schema_version=request.schema_version)
+    return request.to_trajectory().model_copy(update={"steps": steps})
+
+
+def _span_batches(spans: Iterable[DirectSpanInput]) -> Iterator[list[DirectSpanInput]]:
     """Group spans into span-ingest requests within the span-count and byte budgets."""
     batch: list[DirectSpanInput] = []
     batch_size = 0
@@ -151,15 +195,18 @@ def _span_batches(spans: Sequence[DirectSpanInput]) -> Iterator[list[DirectSpanI
         yield batch
 
 
-async def _ingest_trace_spans(intake: AsyncIntakeClient, *, workspace: str, spans: Sequence[DirectSpanInput]) -> None:
-    """Send one trace's spans in bounded requests, its root span last.
+async def _ingest_trace_spans(intake: AsyncIntakeClient, *, workspace: str, spans: Iterator[DirectSpanInput]) -> str:
+    """Send one trace's spans, root first in ``spans``, in bounded requests with the root last; return its id.
 
-    Traces are listed by their root span, so a publish that fails part-way lists no partial trace,
-    and publishing again writes the same span identities, which Intake replaces.
+    Spans are built as the batches fill. Traces are listed by their root span, so a publish that fails
+    part-way lists no partial trace, and publishing again writes the same span identities, which Intake
+    replaces.
     """
-    root, *children = spans
-    for batch in [*_span_batches(children), [root]]:
+    root = next(spans)
+    for batch in _span_batches(spans):
         await intake.create_spans(workspace=workspace, body=DirectSpansIngestRequest(source=ATIF_SOURCE, spans=batch))
+    await intake.create_spans(workspace=workspace, body=DirectSpansIngestRequest(source=ATIF_SOURCE, spans=[root]))
+    return root.span_id
 
 
 def _evaluator_result_request_body(row: mapping.EvaluatorResultCreateParams) -> EvaluatorResultCreateRequest:
@@ -274,7 +321,7 @@ async def publish_to_intake(
             started_at + timedelta(seconds=measurements.runtime_sec) if measurements.runtime_sec is not None else None
         )
 
-        def build_spans(steps: Sequence[AtifStepParam] | None) -> list[DirectSpanInput]:
+        def build_spans(steps: Sequence[AtifStepParam] | None) -> Iterator[DirectSpanInput]:
             body = mapping.trial_to_atif_ingest(
                 trial,
                 run_id=result.run_id,
@@ -289,19 +336,16 @@ async def publish_to_intake(
             )
             # Validate exactly the JSON ATIF ingest would receive, then map it with Intake's own mapping.
             # The run start, not the publish clock, stamps spans without a timestamp, so re-publish replaces them.
-            request = AtifIngestRequest.model_validate_json(
-                AtifCreateRequest(root=body).model_dump_json(exclude_unset=True)
-            )
-            return trajectory_to_spans(
+            return iter_trajectory_spans(
                 workspace=resolved_workspace,
-                trajectory=request.to_trajectory(),
+                trajectory=_atif_trajectory(body),
                 ingested_at=started_at,
             )
 
         recorded_steps = await mapping.atif_steps_from_trial(trial, started_at=started_at)
         try:
             spans = build_spans(recorded_steps)
-        except (ValidationError, AtifTrajectoryDepthError) as error:
+        except ValueError as error:
             # The SDK's ATIF read model accepts shapes ingest does not, so a trajectory that
             # parsed locally can still be refused. Losing the trial's scores over a trace
             # detail is the wrong trade — fall back to the single-step trajectory a runner
@@ -317,8 +361,7 @@ async def publish_to_intake(
             )
             spans = build_spans(None)
 
-        await _ingest_trace_spans(intake, workspace=resolved_workspace, spans=spans)
-        return spans[0].span_id
+        return await _ingest_trace_spans(intake, workspace=resolved_workspace, spans=spans)
 
     async def _publish_trial(trial: AgentEvalTrial) -> PublishedTrial:
         async with semaphore:

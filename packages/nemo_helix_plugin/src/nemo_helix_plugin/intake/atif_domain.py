@@ -9,6 +9,7 @@ These models mirror the small Pydantic schema surface Intake needs from
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import uuid4
@@ -194,7 +195,7 @@ AtifStep = TypeAliasType(
 )
 
 
-def validate_atif_step_ids(steps: list[AtifStep]) -> None:
+def validate_atif_step_ids(steps: Sequence[AtifStep]) -> None:
     """Require one-based sequential step identifiers."""
     # Keep this aligned with NAT's current ATIF model until the format
     # explicitly allows compacted or branched trajectories with gaps.
@@ -206,7 +207,7 @@ def validate_atif_step_ids(steps: list[AtifStep]) -> None:
             )
 
 
-def validate_atif_tool_call_references(steps: list[AtifStep]) -> None:
+def validate_atif_tool_call_references(steps: Sequence[AtifStep]) -> None:
     """Require unique calls and resolvable observation call references."""
     for step in steps:
         tool_call_ids: set[str] = set()
@@ -225,7 +226,7 @@ def validate_atif_tool_call_references(steps: list[AtifStep]) -> None:
                 )
 
 
-def validate_atif_v17_subagent_ref_resolution_keys(steps: list[AtifStep]) -> None:
+def validate_atif_v17_subagent_ref_resolution_keys(steps: Sequence[AtifStep]) -> None:
     """Require v1.7 subagent references to include a resolvable key."""
     for step in steps:
         if step.observation is None:
@@ -237,6 +238,17 @@ def validate_atif_v17_subagent_ref_resolution_keys(steps: list[AtifStep]) -> Non
                         "ATIF-v1.7 SubagentTrajectoryRef MUST set at least one of "
                         "trajectory_id or trajectory_path; session_id alone is informational"
                     )
+
+
+def validate_atif_request_steps(steps: Sequence[AtifStep], *, schema_version: str) -> None:
+    """Validate the steps of an ATIF ingest request.
+
+    Each rule reads the steps in order, so a sequence that produces its steps on access is never held whole.
+    """
+    validate_atif_step_ids(steps)
+    validate_atif_tool_call_references(steps)
+    if schema_version == "ATIF-v1.7":
+        validate_atif_v17_subagent_ref_resolution_keys(steps)
 
 
 class AtifTrajectory(BaseModel):
@@ -329,10 +341,7 @@ class AtifIngestRequest(BaseModel):
     @model_validator(mode="after")
     def validate_steps(self) -> AtifIngestRequest:
         """Validate step references and embedded subagent trajectory IDs."""
-        validate_atif_step_ids(self.steps)
-        validate_atif_tool_call_references(self.steps)
-        if self.schema_version == "ATIF-v1.7":
-            validate_atif_v17_subagent_ref_resolution_keys(self.steps)
+        validate_atif_request_steps(self.steps, schema_version=self.schema_version)
         validate_atif_subagent_trajectory_ids(self.subagent_trajectories)
         return self
 

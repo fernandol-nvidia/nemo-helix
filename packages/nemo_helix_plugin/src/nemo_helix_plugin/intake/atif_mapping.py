@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -72,6 +73,28 @@ def trajectory_to_spans(
     Spans without producer timestamps start at ``ingested_at``. Spans are built without re-validation:
     their values are JSON scalars or ``model_dump(mode="json")`` output, and attributes can be large.
     """
+    return list(
+        iter_trajectory_spans(
+            workspace=workspace,
+            trajectory=trajectory,
+            ingested_at=ingested_at,
+            max_subagent_depth=max_subagent_depth,
+        )
+    )
+
+
+def iter_trajectory_spans(
+    *,
+    workspace: str,
+    trajectory: AtifTrajectory,
+    ingested_at: datetime,
+    max_subagent_depth: int = DEFAULT_ATIF_MAX_SUBAGENT_DEPTH,
+) -> Iterator[DirectSpanInput]:
+    """Yield :func:`trajectory_to_spans`'s spans in order, the root first, building each on demand.
+
+    The tree depth is checked before this returns. Steps are read again for each span that needs them, so a
+    trajectory whose ``steps`` produce each step on access is never held whole.
+    """
     validate_atif_trajectory_depth(trajectory, max_subagent_depth=max_subagent_depth)
     return _trajectory_tree_to_spans(
         workspace=workspace,
@@ -95,7 +118,7 @@ def _trajectory_tree_to_spans(
     ingested_at: datetime,
     depth: int,
     max_subagent_depth: int,
-) -> list[DirectSpanInput]:
+) -> Iterator[DirectSpanInput]:
     """Recursively map a trajectory and its embedded subagents into spans."""
     if depth > max_subagent_depth:
         raise AtifTrajectoryDepthError(f"ATIF trajectory depth {depth} exceeds configured maximum {max_subagent_depth}")
@@ -108,8 +131,8 @@ def _trajectory_tree_to_spans(
         include_evaluation_context=not trajectory_identity,
         ingested_at=ingested_at,
     )
-    spans = [trajectory_span]
-    spans.extend(
+    yield trajectory_span
+    yield from (
         _evaluator_result_to_span(
             workspace=workspace,
             trajectory=trajectory,
@@ -140,8 +163,8 @@ def _trajectory_tree_to_spans(
             step_ended_at=step_ended_at,
             ingested_at=ingested_at,
         )
-        spans.append(step_span)
-        spans.extend(
+        yield step_span
+        yield from (
             _tool_call_to_span(
                 workspace=workspace,
                 default_session_id=trace_session_id,
@@ -165,7 +188,7 @@ def _trajectory_tree_to_spans(
                     subagent = embedded
                     assert subagent.trajectory_id is not None
                     expanded_subagent_ids.add(subagent.trajectory_id)
-                    spans.extend(
+                    yield from (
                         _trajectory_tree_to_spans(
                             workspace=workspace,
                             trajectory=subagent,
@@ -178,7 +201,7 @@ def _trajectory_tree_to_spans(
                         )
                     )
                     continue
-                spans.append(
+                yield (
                     _subagent_ref_to_span(
                         workspace=workspace,
                         default_session_id=trace_session_id,
@@ -201,7 +224,7 @@ def _trajectory_tree_to_spans(
         assert subagent.trajectory_id is not None
         if subagent.trajectory_id in expanded_subagent_ids:
             continue
-        spans.extend(
+        yield from (
             _trajectory_tree_to_spans(
                 workspace=workspace,
                 trajectory=subagent,
@@ -213,7 +236,6 @@ def _trajectory_tree_to_spans(
                 max_subagent_depth=max_subagent_depth,
             )
         )
-    return spans
 
 
 def _trajectory_span_id(
@@ -237,10 +259,9 @@ def _trajectory_to_span(
     ingested_at: datetime,
 ) -> DirectSpanInput:
     """Map one trajectory node to its root agent span."""
-    raw_attributes = _model_dict(trajectory)
-    raw_attributes.pop("steps", None)
-    raw_attributes.pop("evaluation_context", None)
-    raw_attributes.pop("subagent_trajectories", None)
+    raw_attributes = trajectory.model_dump(
+        mode="json", exclude_none=True, exclude={"steps", "evaluation_context", "subagent_trajectories"}
+    )
     # ATIF span IDs are trace-native by design: session_id is the trace identity,
     # while evaluation_context is queryable metadata on the root span.
     #

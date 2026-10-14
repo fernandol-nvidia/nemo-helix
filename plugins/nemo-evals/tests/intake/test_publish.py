@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import AsyncIterable, Iterable
+from collections.abc import AsyncIterable, Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -343,6 +343,40 @@ async def test_the_root_span_is_sent_alone_after_every_other_span(tmp_path: Path
     spans = _published_spans(client, "run-1:t-1")
     assert len(spans) > 1
     assert client.span_calls[-1]["spans"] == [_root(spans)]
+
+
+async def test_spans_are_sent_as_each_batch_fills(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Building every span before sending would hold a long trajectory whole.
+    built = 0
+    mapped = publish.iter_trajectory_spans
+
+    def counting(**kwargs: Any) -> Iterator[DirectSpanInput]:
+        nonlocal built
+        for span in mapped(**kwargs):
+            built += 1
+            yield span
+
+    monkeypatch.setattr(publish, "iter_trajectory_spans", counting)
+    monkeypatch.setattr(publish, "DIRECT_SPANS_MAX_BATCH_SIZE", 1)
+    client = _client()
+    built_at_send: list[int] = []
+    send = client.create_spans
+
+    async def create_spans(**kwargs: Any) -> object:
+        built_at_send.append(built)
+        return await send(**kwargs)
+
+    monkeypatch.setattr(client, "create_spans", create_spans)
+
+    steps = [
+        {"step_id": index, "source": "agent", "message": "a", "timestamp": "2026-01-01T00:00:00+00:00"}
+        for index in range(1, 6)
+    ]
+    trial = _trial_with_atif_trace(tmp_path, steps=steps)
+
+    await publish_to_intake(_result([trial], []), client=client, experiment_id="exp-1")
+
+    assert built_at_send[0] < built
 
 
 async def test_span_requests_stay_within_the_count_and_byte_budgets(
