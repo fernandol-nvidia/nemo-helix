@@ -49,6 +49,7 @@ from nhx_evals_sdk.agent_eval.results import AgentEvalResult
 from nhx_evals_sdk.agent_eval.scores import AgentEvalTaskScore
 from nhx_evals_sdk.agent_eval.trials import AgentEvalTrial, TrialMeasurements
 from nhx_evals_sdk.metrics.utils import metric_type_name
+from nhx_evals_sdk.values.atif import Trajectory
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 logger = logging.getLogger(__name__)
@@ -321,7 +322,7 @@ async def publish_to_intake(
             started_at + timedelta(seconds=measurements.runtime_sec) if measurements.runtime_sec is not None else None
         )
 
-        def build_spans(steps: Sequence[AtifStepParam] | None) -> Iterator[DirectSpanInput]:
+        def build_spans(trajectory: Trajectory | None) -> Iterator[DirectSpanInput]:
             body = mapping.trial_to_atif_ingest(
                 trial,
                 run_id=result.run_id,
@@ -332,7 +333,7 @@ async def publish_to_intake(
                 model_name=model_name,
                 final_metrics=_token_final_metrics(measurements),
                 ended_at=ended_at,
-                steps=steps,
+                trajectory=trajectory,
             )
             # Validate exactly the JSON ATIF ingest would receive, then map it with Intake's own mapping.
             # The run start, not the publish clock, stamps spans without a timestamp, so re-publish replaces them.
@@ -342,16 +343,16 @@ async def publish_to_intake(
                 ingested_at=started_at,
             )
 
-        recorded_steps = await mapping.atif_steps_from_trial(trial, started_at=started_at)
+        trajectory = await mapping.atif_trajectory_from_trial(trial)
         try:
-            spans = build_spans(recorded_steps)
+            spans = build_spans(trajectory)
         except ValueError as error:
             # The SDK's ATIF read model accepts shapes ingest does not, so a trajectory that
             # parsed locally can still be refused. Losing the trial's scores over a trace
             # detail is the wrong trade — fall back to the single-step trajectory a runner
             # with no trace would have sent. Guard on emptiness rather than ``is None``: with no
             # steps to drop, the retry would rebuild the trajectory ingest just refused.
-            if not recorded_steps:
+            if not trajectory:
                 raise
             logger.warning(
                 "ATIF ingest validation rejected the recorded trajectory for trial %s (%s); "

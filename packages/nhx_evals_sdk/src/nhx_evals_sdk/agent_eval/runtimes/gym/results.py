@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from google.protobuf.json_format import MessageToDict
+from nhx_evals_sdk.agent_eval.runtimes.fabric._common import ATIF_ARTIFACT_KIND, ResultView
+from nhx_evals_sdk.agent_eval.runtimes.fabric.otlp_writer import register_trace_evidence
 from nhx_evals_sdk.agent_eval.runtimes.gym.config import DEFAULT_REWARD_KEY, model_call_capture_dir
 from nhx_evals_sdk.agent_eval.runtimes.gym.records import (
     ENV_LOG_NAME,
@@ -27,7 +29,14 @@ from nhx_evals_sdk.agent_eval.runtimes.gym.records import (
     read_jsonl,
 )
 from nhx_evals_sdk.agent_eval.tasks import AgentEvalTask
-from nhx_evals_sdk.agent_eval.trials import AgentEvalTrial, AgentEvalTrialStatus, AgentOutput, TrialMeasurements
+from nhx_evals_sdk.agent_eval.trials import (
+    UNKNOWN_ERROR_TYPE,
+    AgentEvalTrial,
+    AgentEvalTrialStatus,
+    AgentOutput,
+    TrialError,
+    TrialMeasurements,
+)
 from nhx_evals_sdk.agent_eval.usage_keys import (
     CACHE_CREATION_INPUT_TOKENS_KEY,
     CACHE_READ_INPUT_TOKENS_KEY,
@@ -236,13 +245,19 @@ def _rollout_evidence(
             trial_id,
             capture_dir,
         )
-    model_calls = _read_model_calls(capture_path, trial_id=trial_id)
     if capture_path is not None:
         # Kept as its own evidence, by reference: the OTLP view below is a projection of it, and a
         # projection is not a reason to lose what it was projected from.
         descriptors[NG_TRAJECTORY_EVIDENCE] = EvidenceDescriptor(
             kind="filesystem", format="file", ref=str(capture_path)
         )
+    result = record.get("fabric_result")
+    atif = [a.path for a in ResultView.from_mapping(result).artifacts if a.kind == ATIF_ARTIFACT_KIND] if result else []
+    # A single Fabric ATIF already inside this run's work dir travels with the bundle and is the trace.
+    if len(atif) == 1 and Path(atif[0]).resolve().is_relative_to(rollouts_path.parent.resolve()):
+        register_trace_evidence(descriptors, atif=Path(atif[0]), otlp=None)
+        return CandidateEvidence(descriptors=descriptors)
+    model_calls = _read_model_calls(capture_path, trial_id=trial_id)
     resource_spans = _rollout_resource_spans(record, task_id=task_id, trial_id=trial_id, model_calls=model_calls)
     if resource_spans is not None:
         # Rendered to JSON here and only here, because an ``EvidenceDescriptor`` holds JSON.
@@ -663,11 +678,6 @@ def trials_from_rollouts(
     failures_path = _failures_path_for(rollouts_path)
     unattributed_failures = 0
     if failures_path.exists():
-        failure_evidence = CandidateEvidence(
-            descriptors={
-                "rollout_failures": EvidenceDescriptor(kind="filesystem", format="file", ref=str(failures_path))
-            }
-        )
         # tolerant: a truncated line in the abnormal-termination sidecar must not sink the good trials.
         for record in read_jsonl(failures_path, tolerant=True):
             # strict=False to match this loop's tolerant read: an odd record is counted, not fatal.
@@ -677,21 +687,25 @@ def trials_from_rollouts(
                 unattributed_failures += 1
                 continue
             raw_rollout_index = record.get(NG_ROLLOUT_INDEX)
+            trial_id = _rollout_trial_id(
+                task_id, raw_rollout_index, synth_seq, missing_label="fail", attempt=record.get(NG_ATTEMPT_INDEX)
+            )
+            evidence = _rollout_evidence(
+                record, rollouts_path=failures_path, task_id=task_id, trial_id=trial_id, capture_dir=capture_dir
+            )
             trials.append(
                 AgentEvalTrial(
-                    id=_rollout_trial_id(
-                        task_id,
-                        raw_rollout_index,
-                        synth_seq,
-                        missing_label="fail",
-                        attempt=record.get(NG_ATTEMPT_INDEX),
-                    ),
+                    id=trial_id,
                     task_id=task_id,
                     status=AgentEvalTrialStatus.FAILED,
                     output=AgentOutput(
                         response=record.get("response"), metadata={"agent_ref": record.get("agent_ref")}
                     ),
-                    evidence=failure_evidence,
+                    evidence=evidence,
+                    error=TrialError(
+                        type=record.get("_ng_failure_type") or UNKNOWN_ERROR_TYPE,
+                        message=record.get("_ng_failure_message"),
+                    ),
                     measurements=_usage_measurements(record),
                     metadata={
                         "reward": None,

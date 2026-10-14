@@ -34,7 +34,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Literal, cast, overload
 
 from nemo_helix_plugin.intake.types import (
     AtifAgentParam,
@@ -47,6 +47,7 @@ from nemo_helix_plugin.intake.types import (
 )
 from nhx_evals_sdk.agent_eval.scores import AgentEvalScoreStatus, AgentEvalTaskScore
 from nhx_evals_sdk.agent_eval.trials import AgentEvalTrial, TrialMeasurements
+from nhx_evals_sdk.values.atif import Step, Trajectory
 from nhx_evals_sdk.values.evidence import EVIDENCE_FORMAT_ATIF, EVIDENCE_FORMAT_OTLP, EVIDENCE_TRACE
 from nhx_evals_sdk.values.otlp import (
     fill_missing_start_times,
@@ -97,8 +98,8 @@ def run_task_to_evaluation_context(trial: AgentEvalTrial, *, evaluation_name: st
     return {"evaluation_name": evaluation_name, "test_case_name": trial.task_id}
 
 
-async def atif_steps_from_trial(trial: AgentEvalTrial, *, started_at: datetime) -> list[AtifStepParam] | None:
-    """Return the trial's real ATIF steps, or None when it carries no ATIF trajectory.
+async def atif_trajectory_from_trial(trial: AgentEvalTrial) -> Trajectory | None:
+    """Return the trial's real ATIF trajectory, or None when it carries none.
 
     Reads the ATIF view by name rather than the trial's primary trace, which may be an OTLP
     one. Only runners whose agent emits ATIF attach one; Harbor's
@@ -119,21 +120,10 @@ async def atif_steps_from_trial(trial: AgentEvalTrial, *, started_at: datetime) 
         # distinct from a trace that exists but will not read.
         return None
     try:
-        steps = await handle.steps()
+        return await handle.lazy_trace()
     except (OSError, ValueError) as error:
         logger.warning("Ignoring unreadable ATIF trace for trial %s: %s", trial.id, error)
         return None
-
-    payload: list[AtifStepParam] = []
-    for index, step in enumerate(steps):
-        dumped: AtifStepParam = step.model_dump(mode="json", exclude_none=True)
-        # Ingest requires one-based sequential ids, while the SDK read model leaves step_id optional.
-        dumped["step_id"] = index + 1
-        # Intake keys spans on start_time and falls back to its own ingest clock for a step with
-        # no timestamp, which would make re-publish duplicate instead of replace.
-        dumped.setdefault("timestamp", started_at.isoformat())
-        payload.append(dumped)
-    return payload
 
 
 async def otlp_ingest_for_trial(
@@ -214,6 +204,33 @@ def _trial_totals(trial: AgentEvalTrial, measurements: TrialMeasurements) -> dic
     return totals
 
 
+class _StepPayloads(Sequence[AtifStepParam]):
+    """Recorded steps as ingest step payloads, each dumped on access so the steps are never all held."""
+
+    def __init__(self, steps: Sequence[Step], *, started_at: datetime) -> None:
+        self._steps = steps
+        self._started_at = started_at
+
+    def __len__(self) -> int:
+        return len(self._steps)
+
+    @overload
+    def __getitem__(self, index: int) -> AtifStepParam: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[AtifStepParam]: ...
+
+    def __getitem__(self, index: int | slice) -> AtifStepParam | list[AtifStepParam]:
+        if isinstance(index, slice):
+            return [self[position] for position in range(*index.indices(len(self)))]
+        position = range(len(self))[index]
+        dumped: AtifStepParam = self._steps[position].model_dump(mode="json", exclude_none=True)
+        # Ingest requires one-based sequential ids, while the SDK read model leaves step_id optional.
+        dumped["step_id"] = position + 1
+        dumped.setdefault("timestamp", self._started_at.isoformat())
+        return dumped
+
+
 def trial_to_atif_ingest(
     trial: AgentEvalTrial,
     *,
@@ -225,12 +242,12 @@ def trial_to_atif_ingest(
     model_name: str | None = None,
     final_metrics: AtifFinalMetricsParam | None = None,
     ended_at: datetime | None = None,
-    steps: Sequence[AtifStepParam] | None = None,
+    trajectory: Trajectory | None = None,
 ) -> AtifCreateParams:
     """Build the ATIF ingest params for a single Trial.
 
-    ``steps`` carries the trial's real ATIF trajectory when it has one (see
-    :func:`atif_steps_from_trial`). Without it this falls back to a minimal single-step
+    ``trajectory`` is the trial's real ATIF trajectory when it has one (see
+    :func:`atif_trajectory_from_trial`). Without it this falls back to a minimal single-step
     trajectory holding the trial's final output text, which is all a runner that emits no
     trajectory — Harbor's ``oracle``, for one — can offer.
 
@@ -261,13 +278,18 @@ def trial_to_atif_ingest(
                 "end_timestamp": ended_at.timestamp(),
             }
         }
-    step_payload: list[AtifStepParam] = list(steps) if steps else [step]
+    step_payload: Sequence[AtifStepParam] = [step]
+    if trajectory is not None:
+        step_payload = _StepPayloads(trajectory.steps, started_at=started_at)
+        if trajectory.final_metrics is not None:
+            final_metrics = trajectory.final_metrics.model_dump(mode="json", exclude_none=True)
 
     body: AtifCreateParams = {
         "schema_version": ATIF_SCHEMA_VERSION,
         "session_id": session_id_for(run_id, trial.id),
         "agent": agent,
-        "steps": step_payload,
+        # A recorded trajectory's steps are dumped on access; the publisher reads them in order.
+        "steps": cast(list[AtifStepParam], step_payload),
         "evaluation_context": run_task_to_evaluation_context(trial, evaluation_name=evaluation_name),
     }
     if trial.error is not None:
@@ -275,6 +297,8 @@ def trial_to_atif_ingest(
         if trial.error.message is not None:
             error["message"] = trial.error.message
         body["extra"] = {"error": error}
+    if trajectory is not None and trajectory.subagent_trajectories:
+        body["subagent_trajectories"] = trajectory.subagent_trajectories
     if final_metrics is not None:
         body["final_metrics"] = final_metrics
     return body

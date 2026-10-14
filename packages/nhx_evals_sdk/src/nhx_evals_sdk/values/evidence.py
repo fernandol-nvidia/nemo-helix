@@ -23,6 +23,7 @@ from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, PrivateAttr, model_validator
 
 from nhx_evals_sdk.values.atif import FinalMetrics, Step, ToolCall, Trajectory
+from nhx_evals_sdk.values.atif_stream import read_atif_lazily
 from nhx_evals_sdk.values.otlp import (
     parse_resource_spans,
     resource_spans_from_request,
@@ -453,6 +454,18 @@ class ATIFTraceHandle:
             payload = await asyncio.to_thread(self._load_payload)
             self._trajectory = parse_atif(payload)
         return self._trajectory
+
+    async def lazy_trace(self) -> Trajectory:
+        """Return the trajectory read for one pass over its steps.
+
+        A file-backed trace keeps each step as raw JSON validated on access and leaves out the top-level
+        ``extra`` (see :func:`~nhx_evals_sdk.values.atif_stream.read_atif_lazily`); nothing is cached.
+        An inline trace is returned as :meth:`trace` returns it.
+        """
+        descriptor = self._descriptor
+        if descriptor.data is not None or descriptor.ref is None:
+            return await self.trace()
+        return await asyncio.to_thread(read_atif_lazily, _local_filesystem_ref(descriptor.ref))
 
     def _load_payload(self) -> Any:
         descriptor = self._descriptor

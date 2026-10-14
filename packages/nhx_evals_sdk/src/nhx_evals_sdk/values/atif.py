@@ -40,6 +40,7 @@ class ObservationResult(BaseModel):
 
     source_call_id: str | None = Field(default=None, description="Related ToolCall.tool_call_id, if any.")
     content: Any | None = Field(default=None, description="Tool result content retained for evidence readers.")
+    subagent_trajectory_ref: list[dict[str, Any]] | None = Field(default=None, description="Producing subagents.")
     extra: dict[str, Any] | None = Field(default=None, description="Custom result-level metadata.")
 
 
@@ -125,6 +126,7 @@ class Trajectory(BaseModel):
     final_metrics: FinalMetrics | None = Field(default=None, description="Aggregate token metrics, if reported.")
     continued_trajectory_ref: str | None = Field(default=None, description="Reference to a continuation trace.")
     extra: dict[str, Any] | None = Field(default=None, description="Custom trajectory-level metadata.")
+    subagent_trajectories: list[dict[str, Any]] | None = Field(default=None, description="Embedded subagents.")
 
     @field_validator("schema_version")
     @classmethod
