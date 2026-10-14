@@ -130,7 +130,6 @@ from nemo_helix_plugin.client.errors import (
 from nemo_helix_plugin.client.response import NemoPaginatedResponse, NemoResponse
 from nemo_helix_plugin.discovery import AGENT_CLI_GROUP, discover_entry_points
 from nemo_helix_plugin.files.client import FilesClient
-from nemo_helix_plugin.job import NemoJob
 from pydantic import BaseModel, ValidationError
 from typer.main import get_command as _typer_get_command
 
@@ -187,9 +186,6 @@ _COMPUTE_SPEC_LIST_COLUMNS = [
 
 
 _AGENT_CLI_PANEL = "Additional commands from plugins"
-# POC agent-improvement jobs stay registered (service routes, job discovery) but
-# are kept out of `nemo agents` help until the workflow is ready for users.
-_HIDDEN_JOBS = frozenset({"evaluate-suite", "analyze", "optimize-skills"})
 
 
 @dataclass(frozen=True)
@@ -301,10 +297,6 @@ class AgentsCLI(NemoCLI):
         _register_platform_commands(app)
         _register_environment_commands(app)
         return app
-
-    def update_job_cli(self, job_cls: type[NemoJob], group: typer.Typer) -> None:
-        if job_cls.name in _HIDDEN_JOBS:
-            group.info.hidden = True
 
 
 # ---------------------------------------------------------------------------
@@ -3223,9 +3215,18 @@ def _delete_agent_entity_if_present(client: AgentsClient, *, agent_name: str, wo
     return True
 
 
-def _load_yaml(path: Path) -> dict:
-    with open(path, encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
+def _load_yaml(path: Path) -> Any:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return yaml.safe_load(fh)
+    except yaml.YAMLError as error:
+        problem = getattr(error, "problem", None) or "could not parse YAML"
+        mark = getattr(error, "problem_mark", None)
+        location = ""
+        if mark is not None:
+            location = f" at line {mark.line + 1}, column {mark.column + 1}"
+        typer.echo(f"Error: invalid YAML in agent config {path}{location}: {problem}", err=True)
+        raise typer.Exit(code=1) from error
 
 
 # Mirrors ``nemo_agents_plugin.utils._ENV_VAR_PATTERN`` semantics: matches
