@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
 import time
@@ -12,7 +13,7 @@ import uuid
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Coroutine, Generator, Mapping, Protocol, TypeVar
+from typing import Awaitable, Callable, Coroutine, Generator, Mapping, Protocol, TypeVar
 
 import httpx
 from fastapi import FastAPI
@@ -42,7 +43,7 @@ from nhx.platform_runner.loader import order_services_by_dependencies
 from nhx.platform_runner.server import create_app
 from nhx.testing.access_log import AccessLog, AccessLogMiddleware
 from nhx.testing.asyncio_debug import bounded_event_loop_teardown
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 _IN_PROCESS_PLATFORM_BASE_URL = "http://127.0.0.1"
@@ -125,6 +126,13 @@ class TestClientHttpAdapter(httpx.Client):
             content=response.content,
             request=request,
         )
+
+
+async def _call_on_loop[T](loop: asyncio.AbstractEventLoop, call: Callable[[], Awaitable[T]]) -> T:
+    async def run() -> T:
+        return await call()
+
+    return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(run(), loop))
 
 
 SyncClientT = TypeVar("SyncClientT", bound=NemoClient)
@@ -578,7 +586,24 @@ def create_test_client(
             http_client=async_http_client,
             access_key_lifecycle_http_client=async_http_client,
         )
-        transport.app = app
+        service_loop: asyncio.AbstractEventLoop | None = None
+
+        async def _app_on_service_loop(scope: Scope, receive: Receive, send: Send) -> None:
+            caller_loop = asyncio.get_running_loop()
+            if service_loop is None or service_loop is caller_loop:
+                await app(scope, receive, send)
+                return
+
+            # Keep HTTPX's stream and response state on the caller's loop, reading only on demand.
+            async def receive_on_caller_loop() -> Message:
+                return await _call_on_loop(caller_loop, receive)
+
+            async def send_on_caller_loop(message: Message) -> None:
+                await _call_on_loop(caller_loop, lambda: send(message))
+
+            await _call_on_loop(service_loop, lambda: app(scope, receive_on_caller_loop, send_on_caller_loop))
+
+        transport.app = _app_on_service_loop
 
         # Clean up FastAPI app state that tracks model call counts.
         # This ensures call counts are reset between tests.
@@ -633,6 +658,8 @@ def create_test_client(
             app.dependency_overrides.update(all_overrides)
 
         with bounded_event_loop_teardown(), TestClient(app, base_url=platform_base_url) as client:
+            assert client.portal is not None
+            service_loop = client.portal.call(asyncio.get_running_loop)
             sync_http_client = TestClientHttpAdapter(client)
             sync_client = NemoClient(base_url=platform_base_url, http_client=sync_http_client, workspace=workspace)
             for svc in services_to_start:
@@ -670,8 +697,6 @@ def create_test_client(
             if auth_enabled:
 
                 def _seed_auth_role_bindings() -> None:
-                    import asyncio
-
                     from nhx.core.auth.app.embedded_pdp import load_policy_data
                     from nhx.core.auth.app.seeding import run_seeding
 
