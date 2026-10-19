@@ -200,8 +200,10 @@ class TestS3StorageImplInit:
 class TestS3StorageImplListFiles:
     """Test list_files method."""
 
-    async def test_list_files_success(self, s3_impl):
-        """Test listing files from S3 bucket."""
+    @pytest.mark.parametrize("prefix", ["test-prefix", "test-prefix/"])
+    async def test_list_files_success(self, s3_impl, prefix):
+        """Test listing uses a directory prefix and returns relative paths."""
+        s3_impl.config.prefix = prefix
         mock_paginator = MagicMock()
         mock_paginator.paginate.return_value = AsyncIteratorMock(
             [
@@ -218,11 +220,31 @@ class TestS3StorageImplListFiles:
             mock_client.get_paginator = MagicMock(return_value=mock_paginator)
             files = await s3_impl.list_files()
 
+        mock_paginator.paginate.assert_called_once_with(Bucket="test-bucket", Prefix="test-prefix/")
         assert len(files) == 2
         assert files[0].path == "file1.txt"
         assert files[0].size == 100
         assert files[1].path == "dir/file2.txt"
         assert files[1].size == 200
+
+    @pytest.mark.parametrize("prefix", ["test-prefix", "test-prefix/", ""])
+    @pytest.mark.parametrize("path", [None, "dir", "dir/", "file.txt"])
+    async def test_list_files_path_filter(self, s3_impl, prefix, path):
+        """The path filter does not change the returned paths' base."""
+        s3_impl.config.prefix = prefix
+        storage_prefix = "test-prefix/" if prefix else ""
+        relative_path = path + "file.txt" if path else "file.txt"
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = AsyncIteratorMock(
+            [{"Contents": [{"Key": storage_prefix + relative_path, "Size": 10}]}]
+        )
+
+        async with mock_s3_client(s3_impl) as mock_client:
+            mock_client.get_paginator = MagicMock(return_value=mock_paginator)
+            files = await s3_impl.list_files(path)
+
+        mock_paginator.paginate.assert_called_once_with(Bucket="test-bucket", Prefix=storage_prefix + (path or ""))
+        assert [file.path for file in files] == [relative_path]
 
     async def test_list_files_skips_directory_markers(self, s3_impl):
         """Test that directory markers (keys ending with /) are skipped."""
@@ -506,8 +528,10 @@ class TestS3StorageImplFileOperations:
 class TestS3StorageImplDeleteAll:
     """Test delete_all method."""
 
-    async def test_delete_all_success(self, s3_impl):
-        """Test successful bulk deletion."""
+    @pytest.mark.parametrize("prefix", ["test-prefix", "test-prefix/", ""])
+    async def test_delete_all_success(self, s3_impl, prefix):
+        """Test bulk deletion uses a directory prefix, or the whole bucket."""
+        s3_impl.config.prefix = prefix
         mock_paginator = MagicMock()
         mock_paginator.paginate.return_value = AsyncIteratorMock(
             [
@@ -524,6 +548,7 @@ class TestS3StorageImplDeleteAll:
             mock_client.get_paginator = MagicMock(return_value=mock_paginator)
             await s3_impl.delete_all()
 
+        mock_paginator.paginate.assert_called_once_with(Bucket="test-bucket", Prefix="test-prefix/" if prefix else "")
         mock_client.delete_objects.assert_called_once()
 
     async def test_delete_all_empty(self, s3_impl):
