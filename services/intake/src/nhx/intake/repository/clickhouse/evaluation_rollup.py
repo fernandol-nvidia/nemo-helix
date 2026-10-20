@@ -11,7 +11,11 @@ from nhx.intake.repository.clickhouse.executor import ClickHouseExecutor, ClickH
 from nhx.intake.repository.clickhouse.tables import ClickHouseTable
 from nhx.intake.repository.evaluation_rollup import EvaluationRollup, EvaluationRollupRepository, ScoreRollup
 from nhx.intake.spans.span_attribute_catalog import COST_SCALE, SpanAttributeField, spec_for_field
+from nhx.intake.spans.span_rollups import usage_sql
 from nhx.intake.spans.storage import float_or_none
+
+# Per-trace cost and tokens under the usage rule, unscaled: session_costs sums each session's traces, then scales.
+_SESSION_USAGE = usage_sql(("cost_usd", "input_tokens", "output_tokens"), scaled=False)
 
 
 class ClickHouseEvaluationRollupRepository(EvaluationRollupRepository):
@@ -72,9 +76,7 @@ class ClickHouseEvaluationRollupRepository(EvaluationRollupRepository):
                 ),
                 parameters={
                     **parameters,
-                    "cost_key": spec_for_field(SpanAttributeField.COST_TOTAL_USD).bag_key,
-                    "input_tokens_key": spec_for_field(SpanAttributeField.INPUT_TOKENS).bag_key,
-                    "output_tokens_key": spec_for_field(SpanAttributeField.OUTPUT_TOKENS).bag_key,
+                    **_SESSION_USAGE.parameters,
                     "model_key": spec_for_field(SpanAttributeField.MODEL).bag_key,
                     "agent_name_key": spec_for_field(SpanAttributeField.AGENT_NAME).bag_key,
                     "agent_version_key": spec_for_field(SpanAttributeField.AGENT_VERSION).bag_key,
@@ -320,32 +322,30 @@ def _current_session_span_metrics_sql(spans_table: str) -> str:
     """Latest-version spans for the scoped sessions, projected to *only* the metric inputs.
 
     The shared ``current_spans_sql`` emits every span column, including the full ``attributes_*`` Maps.
-    The metric rollup then joins that to the sessions, so the join hash table would hold every deduped
-    span with its maps — gigabytes on real agent workloads (long trajectories × many spans), which is
-    what trips ClickHouse's memory limit. Here we ``argMax`` just the cost and token values (plus a
-    present-flag each, to keep an absent metric distinct from a real 0) and the model/agent strings, so
-    the join carries a handful of scalars per span instead. Deduping by span identity picks each span's
+    Sorting every version with its maps would take gigabytes on real agent workloads (long trajectories ×
+    many spans), which is what trips ClickHouse's memory limit. Here each version keeps just the usage-rule
+    inputs (see span_rollups) and the model/agent strings, so the sort carries a handful of scalars per
+    span, a fraction of the memory of an ``argMax`` per column. Deduping by span identity picks each span's
     latest version.
     """
     return f"""
         (
             SELECT
                 workspace,
-                argMax(session_id, (event_ts, is_deleted)) AS dedup_session_id,
-                argMax(attributes_number[%(cost_key)s], (event_ts, is_deleted)) AS cost_value,
-                argMax(has(mapKeys(attributes_number), %(cost_key)s), (event_ts, is_deleted)) AS cost_present,
-                argMax(attributes_number[%(input_tokens_key)s], (event_ts, is_deleted)) AS input_tokens_value,
-                argMax(has(mapKeys(attributes_number), %(input_tokens_key)s), (event_ts, is_deleted)) AS input_tokens_present,
-                argMax(attributes_number[%(output_tokens_key)s], (event_ts, is_deleted)) AS output_tokens_value,
-                argMax(has(mapKeys(attributes_number), %(output_tokens_key)s), (event_ts, is_deleted)) AS output_tokens_present,
-                argMax(attributes_string[%(model_key)s], (event_ts, is_deleted)) AS model_name,
-                argMax(attributes_string[%(agent_name_key)s], (event_ts, is_deleted)) AS agent_name,
-                argMax(attributes_string[%(agent_version_key)s], (event_ts, is_deleted)) AS agent_version,
-                argMax(is_deleted, (event_ts, is_deleted)) AS del_flag
+                session_id,
+                source_format,
+                trace_id,
+                is_deleted,
+                {_SESSION_USAGE.span_columns},
+                attributes_string[%(model_key)s] AS model_name,
+                attributes_string[%(agent_name_key)s] AS agent_name,
+                attributes_string[%(agent_version_key)s] AS agent_version
             FROM {spans_table}
             WHERE workspace = %(workspace)s
                 AND (workspace, session_id) IN (SELECT DISTINCT workspace, session_id FROM scoped_sessions)
-            GROUP BY workspace, source_format, trace_id, external_span_id, id
+            -- Each span's latest version: newest first, and a delete wins a tie.
+            ORDER BY event_ts DESC, is_deleted DESC
+            LIMIT 1 BY workspace, source_format, trace_id, external_span_id, id
         )
     """
 
@@ -361,30 +361,38 @@ def _metric_rollups_sql(*, trace_index_table: str, spans_table: str, evaluation_
             {_scoped_sessions_sql(trace_index_table, evaluation_names_sql)}
         ),
         current_session_spans AS {_current_session_span_metrics_sql(spans_table)},
+        -- Per trace: usage totals, and the model and agent names. session_costs adds up each session's traces and
+        -- deduplicates its names.
+        session_traces AS (
+            SELECT
+                spans.workspace AS workspace,
+                spans.session_id AS session_id,
+                {_SESSION_USAGE.trace_columns},
+                groupArrayIf(spans.model_name, spans.model_name != '') AS model_names,
+                groupArrayIf(spans.agent_name, spans.agent_name != '') AS agent_names,
+                groupArrayIf(spans.agent_version, spans.agent_version != '') AS agent_versions
+            FROM current_session_spans AS spans
+            WHERE spans.is_deleted = 0
+            GROUP BY spans.workspace, spans.session_id, spans.source_format, spans.trace_id
+        ),
         session_costs AS (
             SELECT
                 sessions.evaluation_name AS evaluation_name,
                 sessions.test_case_name AS test_case_key,
                 sessions.latency_ms AS latency_ms,
+                sum(traces.cost_usd) / {COST_SCALE} AS cost_usd,
                 if(
-                    countIf(spans.cost_present) = 0,
+                    sum(traces.input_tokens) IS NULL AND sum(traces.output_tokens) IS NULL,
                     NULL,
-                    sumIf(spans.cost_value, spans.cost_present) / {COST_SCALE}
-                ) AS cost_usd,
-                if(
-                    countIf(spans.input_tokens_present) = 0 AND countIf(spans.output_tokens_present) = 0,
-                    NULL,
-                    sumIf(spans.input_tokens_value, spans.input_tokens_present)
-                        + sumIf(spans.output_tokens_value, spans.output_tokens_present)
+                    coalesce(sum(traces.input_tokens), 0) + coalesce(sum(traces.output_tokens), 0)
                 ) AS tokens,
-                groupUniqArrayIf(spans.model_name, spans.model_name != '') AS model_names,
-                groupUniqArrayIf(spans.agent_name, spans.agent_name != '') AS agent_names,
-                groupUniqArrayIf(spans.agent_version, spans.agent_version != '') AS agent_versions
+                groupUniqArrayArray(traces.model_names) AS model_names,
+                groupUniqArrayArray(traces.agent_names) AS agent_names,
+                groupUniqArrayArray(traces.agent_versions) AS agent_versions
             FROM scoped_sessions AS sessions
-            LEFT JOIN current_session_spans AS spans
-                ON sessions.workspace = spans.workspace
-                AND sessions.session_id = spans.dedup_session_id
-                AND spans.del_flag = 0
+            LEFT JOIN session_traces AS traces
+                ON sessions.workspace = traces.workspace
+                AND sessions.session_id = traces.session_id
             WHERE sessions.test_case_name != ''
             GROUP BY sessions.evaluation_name, sessions.session_id, sessions.test_case_name, sessions.latency_ms
         ),

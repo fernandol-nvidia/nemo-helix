@@ -28,7 +28,7 @@ from nhx.intake.spans.domain import (
     TraceMode,
 )
 from nhx.intake.spans.span_attribute_catalog import SpanAttributeField, spec_for_field
-from nhx.intake.spans.span_rollups import METRIC_ATTRIBUTE_FIELDS, metric_aggregate_columns
+from nhx.intake.spans.span_rollups import METRIC_ATTRIBUTE_FIELDS, usage_sql
 from nhx.intake.spans.storage import (
     float_or_none,
     int_or_none,
@@ -90,6 +90,7 @@ _CURRENT_SPAN_VALUE_COLUMNS = (
 )
 
 _ZERO_DATETIME = datetime.fromtimestamp(0, tz=timezone.utc)
+_TRACE_USAGE = usage_sql()
 
 
 @dataclass(frozen=True)
@@ -490,7 +491,13 @@ def _trace_aggregates_sql(
     query = f"""
         SELECT
             {select_columns}
-        FROM {current_spans} AS {source_alias}
+        FROM (
+            -- Each current span, with the inputs of the usage rule (see span_rollups).
+            SELECT
+                *,
+                {_TRACE_USAGE.span_columns}
+            FROM {current_spans}
+        ) AS {source_alias}
         WHERE {source_alias}.is_deleted = 0
         GROUP BY {source_alias}.workspace, {source_alias}.source_format, {source_alias}.trace_id
     """
@@ -498,7 +505,7 @@ def _trace_aggregates_sql(
 
 
 def _trace_aggregate_select_columns(source_alias: str) -> tuple[str, dict[str, Any]]:
-    metric_columns, parameters = metric_aggregate_columns(source_alias)
+    parameters = dict(_TRACE_USAGE.parameters)
     parameters.update(
         model_key=spec_for_field(SpanAttributeField.MODEL).bag_key,
         provider_key=spec_for_field(SpanAttributeField.PROVIDER).bag_key,
@@ -507,7 +514,7 @@ def _trace_aggregate_select_columns(source_alias: str) -> tuple[str, dict[str, A
         f"{source_alias}.workspace AS workspace",
         f"{source_alias}.source_format AS source_format",
         f"{source_alias}.trace_id AS trace_id",
-        metric_columns,
+        _TRACE_USAGE.trace_columns,
         _unique_string_attribute_aggregate(source_alias, parameter="model_key", alias="models"),
         _unique_string_attribute_aggregate(source_alias, parameter="provider_key", alias="providers"),
         "count() AS span_count",

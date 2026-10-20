@@ -3,6 +3,7 @@
 
 """Session repository tests."""
 
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -33,15 +34,13 @@ def test_session_query_is_primary_key_pruned_and_payload_free() -> None:
     query = _session_detail_query("spans")
 
     assert query.name == "sessions.get"
-    assert "FROM spans AS session_spans FINAL" in query.statement
-    assert "PREWHERE" in query.statement
-    assert "session_spans.workspace = %(workspace)s" in query.statement
-    assert "session_spans.session_id = %(session_id)s" in query.statement
+    assert "FROM spans FINAL" in query.statement
+    assert "PREWHERE workspace = %(workspace)s AND session_id = %(session_id)s" in query.statement
     assert "trace_index" not in query.statement
     assert "JOIN" not in query.statement
-    assert "session_spans.input" not in query.statement
-    assert "session_spans.output" not in query.statement
-    assert "uniqExact(session_spans.source_format, session_spans.trace_id) AS trace_count" in query.statement
+    assert "*" not in query.statement
+    assert re.search(r"\b(input|output)\b", query.statement) is None
+    assert "GROUP BY session_spans.source_format, session_spans.trace_id" in query.statement
     assert "count() AS span_count" in query.statement
     assert query.parameters["input_tokens_key"] == "llm.token_count.prompt"
     assert query.parameters["cost_usd_key"] == "cost.total"

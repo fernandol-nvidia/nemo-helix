@@ -12,7 +12,7 @@ from nhx.intake.repository.clickhouse.executor import ClickHouseExecutor, ClickH
 from nhx.intake.repository.clickhouse.tables import ClickHouseTable
 from nhx.intake.repository.session import SessionRepository
 from nhx.intake.spans.domain import IntakeSession
-from nhx.intake.spans.span_rollups import metric_aggregate_columns
+from nhx.intake.spans.span_rollups import summed_metric_columns, usage_sql
 from nhx.intake.spans.storage import float_or_none, int_or_none, normalize_span_status
 
 
@@ -32,38 +32,57 @@ class ClickHouseSessionRepository(SessionRepository):
 def _session_detail_query(table: str) -> ClickHouseQuery:
     """Build a primary-key-pruned aggregate over the current rows of one session."""
 
-    source_alias = "session_spans"
-    metric_columns, parameters = metric_aggregate_columns(source_alias)
+    usage = usage_sql(scaled=False)
     statement = f"""
+        WITH
+        -- The session's current spans: the columns the session reads, and the inputs of the usage rule.
+        session_spans AS (
+            SELECT
+                source_format,
+                trace_id,
+                start_time,
+                end_time,
+                status,
+                {usage.span_columns}
+            FROM {table} FINAL
+            PREWHERE workspace = %(workspace)s AND session_id = %(session_id)s
+            WHERE is_deleted = 0
+        ),
+        -- One row per trace: its usage (see span_rollups) and its span times and counts.
+        session_traces AS (
+            SELECT
+                min(session_spans.start_time) AS started_at,
+                max(session_spans.end_time) AS ended_at,
+                countIf(session_spans.end_time = toDateTime64(0, 6)) AS open_span_count,
+                countIf(session_spans.status = 'error') AS error_span_count,
+                countIf(session_spans.status = 'cancelled') AS cancelled_span_count,
+                countIf(session_spans.status = 'unknown') AS unknown_span_count,
+                {usage.trace_columns},
+                count() AS span_count
+            FROM session_spans
+            GROUP BY session_spans.source_format, session_spans.trace_id
+        )
         SELECT
             %(session_id)s AS id,
-            any({source_alias}.workspace) AS workspace,
-            min({source_alias}.start_time) AS started_at,
-            if(
-                countIf({source_alias}.end_time = toDateTime64(0, 6)) > 0,
-                NULL,
-                max({source_alias}.end_time)
-            ) AS ended_at,
+            %(workspace)s AS workspace,
+            min(session_traces.started_at) AS started_at,
+            if(sum(session_traces.open_span_count) > 0, NULL, max(session_traces.ended_at)) AS ended_at,
             multiIf(
-                countIf({source_alias}.status = 'error') > 0, 'error',
-                countIf({source_alias}.status = 'cancelled') > 0, 'cancelled',
-                countIf({source_alias}.status = 'unknown') > 0, 'unknown',
+                sum(session_traces.error_span_count) > 0, 'error',
+                sum(session_traces.cancelled_span_count) > 0, 'cancelled',
+                sum(session_traces.unknown_span_count) > 0, 'unknown',
                 'success'
             ) AS status,
-            {metric_columns},
-            uniqExact({source_alias}.source_format, {source_alias}.trace_id) AS trace_count,
-            count() AS span_count
-        FROM {table} AS {source_alias} FINAL
-        PREWHERE
-            {source_alias}.workspace = %(workspace)s
-            AND {source_alias}.session_id = %(session_id)s
-        WHERE {source_alias}.is_deleted = 0
+            {summed_metric_columns("session_traces")},
+            count() AS trace_count,
+            sum(session_traces.span_count) AS span_count
+        FROM session_traces
         HAVING span_count > 0
     """
     return ClickHouseQuery(
         name="sessions.get",
         statement=statement,
-        parameters=parameters,
+        parameters=usage.parameters,
     )
 
 

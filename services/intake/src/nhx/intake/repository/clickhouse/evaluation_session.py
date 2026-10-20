@@ -4,8 +4,8 @@
 """ClickHouse implementation of per-session Evaluation reads.
 
 Returns one row per ingested session (test case execution), using ``trace_index``
-for root/session membership and per-session aggregates from all spans (tokens +
-cost), plus per-evaluator session-mean scores from ``evaluator_results``.
+for root/session membership and per-session token and cost aggregates that count
+each model call once, plus per-evaluator session-mean scores from ``evaluator_results``.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from nhx.intake.repository.evaluation_session import (
     MetricSortTooLargeError,
 )
 from nhx.intake.spans.domain import IntakeResponseMode, SpanStatus
-from nhx.intake.spans.span_attribute_catalog import COST_SCALE, SpanAttributeField, spec_for_field
+from nhx.intake.spans.span_rollups import summed_metric_columns, usage_sql
 from nhx.intake.spans.storage import (
     float_or_none,
     int_or_none,
@@ -107,10 +107,7 @@ class ClickHouseEvaluationSessionRepository(EvaluationSessionRepository):
         base_parameters: dict[str, Any] = {
             "workspace": workspace,
             "evaluation_name": evaluation_name,
-            "input_tokens_key": spec_for_field(SpanAttributeField.INPUT_TOKENS).bag_key,
-            "output_tokens_key": spec_for_field(SpanAttributeField.OUTPUT_TOKENS).bag_key,
-            "cached_tokens_key": spec_for_field(SpanAttributeField.CACHED_TOKENS).bag_key,
-            "cost_key": spec_for_field(SpanAttributeField.COST_TOTAL_USD).bag_key,
+            **usage_sql().parameters,
         }
 
         count_sql = _count_sql(
@@ -341,22 +338,18 @@ def _metric_sort_page_refs_sql(
         scoped_sessions AS (
             {scoped_sessions_sql}
         ),
+        {_session_metrics_ctes(all_scoped_spans, ("cost_usd", "input_tokens", "output_tokens"))},
         pre_page_metrics AS (
             SELECT
-                s.workspace AS workspace,
-                s.session_id AS session_id,
-                {_guarded_sum_sql("cost_key", scale=COST_SCALE)} AS cost_total_usd,
+                metrics.workspace AS workspace,
+                metrics.session_id AS session_id,
+                metrics.cost_usd AS cost_total_usd,
                 if(
-                    {_guarded_sum_sql("input_tokens_key")} IS NULL AND {_guarded_sum_sql("output_tokens_key")} IS NULL,
+                    metrics.input_tokens IS NULL AND metrics.output_tokens IS NULL,
                     NULL,
-                    coalesce({_guarded_sum_sql("input_tokens_key")}, 0) + coalesce({_guarded_sum_sql("output_tokens_key")}, 0)
+                    coalesce(metrics.input_tokens, 0) + coalesce(metrics.output_tokens, 0)
                 ) AS total_tokens
-            FROM scoped_sessions AS s
-            LEFT JOIN {all_scoped_spans} AS spans
-                ON s.workspace = spans.workspace
-                AND s.session_id = spans.session_id
-                AND spans.is_deleted = 0
-            GROUP BY s.workspace, s.session_id
+            FROM session_metrics AS metrics
         )
         SELECT
             s.session_id,
@@ -429,18 +422,7 @@ def _hydrate_by_refs_sql(
         current_page_spans AS (
             {page_spans}
         ),
-        session_metrics AS (
-            SELECT
-                spans.workspace AS workspace,
-                spans.session_id AS session_id,
-                {_guarded_sum_sql("input_tokens_key")} AS input_tokens,
-                {_guarded_sum_sql("output_tokens_key")} AS output_tokens,
-                {_guarded_sum_sql("cached_tokens_key")} AS cached_tokens,
-                {_guarded_sum_sql("cost_key", scale=COST_SCALE)} AS cost_total_usd
-            FROM current_page_spans AS spans
-            WHERE spans.is_deleted = 0
-            GROUP BY spans.workspace, spans.session_id
-        ),
+        {_session_metrics_ctes("current_page_spans", ("input_tokens", "output_tokens", "cached_tokens", "cost_usd"))},
         session_scores AS (
             SELECT
                 workspace,
@@ -484,7 +466,7 @@ def _hydrate_by_refs_sql(
             metrics.input_tokens AS input_tokens,
             metrics.output_tokens AS output_tokens,
             metrics.cached_tokens AS cached_tokens,
-            metrics.cost_total_usd AS cost_total_usd,
+            metrics.cost_usd AS cost_total_usd,
             scores.evaluator_scores AS evaluator_scores,
             scores.failed_evaluators AS failed_evaluators
         FROM page_sessions AS sessions
@@ -508,18 +490,39 @@ def _page_ref_parameters(refs: list[_SessionPageRef]) -> dict[str, object]:
     }
 
 
-def _guarded_sum_sql(parameter_name: str, *, scale: int = 1) -> str:
-    key = f"%({parameter_name})s"
-    sum_expr = f"sumIf(spans.attributes_number[{key}], has(mapKeys(spans.attributes_number), {key}))"
-    if scale != 1:
-        sum_expr = f"{sum_expr} / {scale}"
-    return f"""
-        if(
-            countIf(has(mapKeys(spans.attributes_number), {key})) = 0,
-            NULL,
-            {sum_expr}
-        )
+def _session_metrics_ctes(spans_source: str, metrics: tuple[str, ...]) -> str:
+    """CTEs ending in ``session_metrics``: one row per session in ``spans_source``, with a column per metric.
+
+    The CTEs apply the usage rule per span, per trace and per session (see span_rollups), so cost comes out in USD.
+    The caller binds ``usage_sql().parameters``.
     """
+    usage = usage_sql(metrics, scaled=False)
+    return f"""
+        -- Per span: the inputs of the usage rule.
+        session_span_usage AS (
+            SELECT
+                *,
+                {usage.span_columns}
+            FROM {spans_source}
+        ),
+        -- Per trace: each metric's total.
+        session_traces AS (
+            SELECT
+                spans.session_id AS session_id,
+                {usage.trace_columns}
+            FROM session_span_usage AS spans
+            WHERE spans.is_deleted = 0
+            GROUP BY spans.session_id, spans.source_format, spans.trace_id
+        ),
+        -- Per session: the traces' totals added up, cost in USD.
+        session_metrics AS (
+            SELECT
+                %(workspace)s AS workspace,
+                traces.session_id AS session_id,
+                {summed_metric_columns("traces", metrics)}
+            FROM session_traces AS traces
+            GROUP BY traces.session_id
+        )"""
 
 
 def _row(record: dict[str, Any]) -> EvaluationSessionRow:

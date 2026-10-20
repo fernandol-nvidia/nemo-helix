@@ -108,3 +108,18 @@ def test_session_detail_rolls_up_all_current_spans(
 
     missing = client.get("/apis/intake/v2/workspaces/default/sessions/missing")
     assert missing.status_code == 404
+
+
+def test_session_detail_has_no_end_while_a_span_is_open(client: TestClient, make_otlp_request) -> None:
+    attributes = {"gen_ai.conversation.id": "session-detail-open"}
+    response = client.post(
+        "/apis/intake/v2/workspaces/default/ingest/otlp/v1/traces",
+        content=make_otlp_request([{"attributes": attributes}, {"end_time_unix_nano": 0, "attributes": attributes}]),
+        headers={"Content-Type": "application/x-protobuf"},
+    )
+    assert response.status_code == 200, response.text
+
+    response = client.get("/apis/intake/v2/workspaces/default/sessions/session-detail-open")
+
+    assert response.status_code == 200, response.text
+    assert "ended_at" not in response.json()
