@@ -668,6 +668,24 @@ class TestS3DefaultStorageConfig:
             files.delete_fileset(name=name1, workspace=DEFAULT_WORKSPACE)
             files.delete_fileset(name=name2, workspace=DEFAULT_WORKSPACE)
 
+    def test_colliding_fileset_names_with_s3_default(self, client_with_s3_default: NemoClient):
+        """Listing and deleting foo must leave foo-bar's files intact."""
+        files = FilesClient.from_client(client_with_s3_default)
+        name = f"foo-{uuid.uuid4().hex[:8]}"
+        neighbor = f"{name}-bar"
+        with create_fileset(files, neighbor) as neighbor_fileset:
+            files.upload_file(
+                content=b"neighbor", path="a.txt", name=neighbor_fileset.name, workspace=DEFAULT_WORKSPACE
+            )
+            with create_fileset(files, name) as fileset:
+                files.upload_file(content=b"own", path="dir/a.txt", name=fileset.name, workspace=DEFAULT_WORKSPACE)
+                listed = files.list_files(name=name, workspace=DEFAULT_WORKSPACE).data().data
+                assert [(file.path, file.size) for file in listed] == [("dir/a.txt", 3)]
+
+            listed = files.list_files(name=neighbor, workspace=DEFAULT_WORKSPACE).data().data
+            assert [(file.path, file.size) for file in listed] == [("a.txt", 8)]
+            assert files.download_file(name=neighbor, workspace=DEFAULT_WORKSPACE, path="a.txt").read() == b"neighbor"
+
     def test_download_from_huggingface_fileset_with_s3_default(self, client_with_s3_default: NemoClient):
         """Test downloading from a HuggingFace fileset works with S3 as default storage.
 

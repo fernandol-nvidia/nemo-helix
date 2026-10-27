@@ -159,15 +159,11 @@ class S3StorageImpl(StorageImpl):
         - path="dir" matches "dir/file.txt", "dir/subdir/file.txt", etc.
         - path="file.txt" matches "file.txt" (exact match)
 
-        Note: We don't add a trailing slash to the prefix because that would
-        prevent matching files (e.g., "file.txt/" won't match "file.txt").
+        The storage prefix is a directory; the optional path remains a raw
+        prefix filter so that it can match files as well as directories.
         """
-        prefix = self.config.prefix
-        if path:
-            if prefix:
-                prefix = f"{prefix.rstrip('/')}/{path}"
-            else:
-                prefix = path
+        storage_prefix = self._full_key("")
+        prefix = storage_prefix + (path or "")
 
         files = []
         async with self._client() as client:
@@ -180,10 +176,7 @@ class S3StorageImpl(StorageImpl):
                     for obj in page.get("Contents", []):
                         key = obj["Key"]
                         # Make path relative to prefix
-                        if self.config.prefix:
-                            relative_path = key[len(self.config.prefix.rstrip("/")) + 1 :]
-                        else:
-                            relative_path = key
+                        relative_path = key[len(storage_prefix) :]
 
                         # Skip "directory" markers (keys ending with /)
                         if relative_path and not relative_path.endswith("/"):
@@ -312,7 +305,7 @@ class S3StorageImpl(StorageImpl):
 
     async def delete_all(self) -> None:
         """Delete all files under the prefix in the S3 bucket."""
-        prefix = self.config.prefix or ""
+        prefix = self._full_key("")
 
         async with self._client() as client:
             try:
