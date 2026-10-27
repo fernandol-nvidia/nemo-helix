@@ -304,8 +304,9 @@ class S3StorageImpl(StorageImpl):
                 _raise_for_s3_error(e, f"deleting {path}")
 
     async def delete_all(self) -> None:
-        """Delete all files under the prefix in the S3 bucket."""
-        prefix = self._full_key("")
+        """Delete the configured prefix object and files under its directory."""
+        prefix = self.config.prefix or ""
+        directory_prefix = self._full_key("")
 
         async with self._client() as client:
             try:
@@ -315,7 +316,11 @@ class S3StorageImpl(StorageImpl):
                     Bucket=self.config.bucket,
                     Prefix=prefix,
                 ):
-                    objects = page.get("Contents", [])
+                    objects = [
+                        obj
+                        for obj in page.get("Contents", [])
+                        if obj["Key"] == prefix or obj["Key"].startswith(directory_prefix)
+                    ]
                     if objects:
                         delete_request: dict[str, Any] = {"Objects": [{"Key": obj["Key"]} for obj in objects]}
                         await client.delete_objects(

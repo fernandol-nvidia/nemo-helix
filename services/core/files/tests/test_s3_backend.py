@@ -530,7 +530,7 @@ class TestS3StorageImplDeleteAll:
 
     @pytest.mark.parametrize("prefix", ["test-prefix", "test-prefix/", ""])
     async def test_delete_all_success(self, s3_impl, prefix):
-        """Test bulk deletion uses a directory prefix, or the whole bucket."""
+        """Test bulk deletion preserves the configured prefix query."""
         s3_impl.config.prefix = prefix
         mock_paginator = MagicMock()
         mock_paginator.paginate.return_value = AsyncIteratorMock(
@@ -548,13 +548,37 @@ class TestS3StorageImplDeleteAll:
             mock_client.get_paginator = MagicMock(return_value=mock_paginator)
             await s3_impl.delete_all()
 
-        mock_paginator.paginate.assert_called_once_with(Bucket="test-bucket", Prefix="test-prefix/" if prefix else "")
+        mock_paginator.paginate.assert_called_once_with(Bucket="test-bucket", Prefix=prefix)
         mock_client.delete_objects.assert_called_once()
 
-    async def test_delete_all_empty(self, s3_impl):
-        """Test delete_all on empty bucket doesn't call delete_objects."""
+    @pytest.mark.parametrize("prefix", ["foo", "foo.txt"])
+    @pytest.mark.parametrize("trailing_slash", ["", "/"])
+    async def test_delete_all_preserves_prefix_object_and_directory(self, s3_impl, prefix, trailing_slash):
+        """Delete the exact key and descendants without deleting prefix neighbors."""
+        s3_impl.config.prefix = prefix + trailing_slash
+        owned_keys = [prefix, f"{prefix}/", f"{prefix}/file.txt", f"{prefix}/dir.txt/file.txt"]
+        neighbor_keys = [
+            f"{prefix}{suffix}" for suffix in ["-bar", "-bar/a.txt", ".txt", ".txt/a.txt", "bar", "bar/a.txt"]
+        ]
         mock_paginator = MagicMock()
-        mock_paginator.paginate.return_value = AsyncIteratorMock([{"Contents": []}])
+        mock_paginator.paginate.side_effect = lambda **kwargs: AsyncIteratorMock(
+            [{"Contents": [{"Key": key} for key in owned_keys + neighbor_keys if key.startswith(kwargs["Prefix"])]}]
+        )
+
+        async with mock_s3_client(s3_impl) as mock_client:
+            mock_client.get_paginator = MagicMock(return_value=mock_paginator)
+            await s3_impl.delete_all()
+
+        mock_client.delete_objects.assert_awaited_once_with(
+            Bucket="test-bucket",
+            Delete={"Objects": [{"Key": key} for key in (owned_keys[1:] if trailing_slash else owned_keys)]},
+        )
+
+    @pytest.mark.parametrize("keys", [[], ["test-prefix-bar/file.txt", "test-prefix.txt", "test-prefixbar"]])
+    async def test_delete_all_empty(self, s3_impl, keys):
+        """Empty pages and prefix neighbors must not produce a delete request."""
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = AsyncIteratorMock([{"Contents": [{"Key": key} for key in keys]}])
 
         async with mock_s3_client(s3_impl) as mock_client:
             mock_client.get_paginator = MagicMock(return_value=mock_paginator)
