@@ -74,11 +74,13 @@ from nemo_helix_plugin.client.tls import client_verify_from_env
 from nemo_helix_plugin.client.types import (
     PATH_SPEC,
     RESPONSE_VALIDATION_CONTEXT,
+    AsyncReplayableStream,
     BinaryContent,
     OffsetPagination,
     Paginated,
     PaginationStrategy,
     PreparedRequest,
+    ReplayableStream,
     ResponseT,
     RetryPolicy,
     StrategyT,
@@ -337,7 +339,8 @@ def _is_replayable(content: bytes | Iterable[bytes] | AsyncIterable[bytes] | Non
     """Whether a request body can be handed to httpx more than once.
 
     ``bytes``, ``str``, no body at all, and in-memory sequences replay fine —
-    httpx re-reads them from the start on every attempt.
+    httpx re-reads them from the start on every attempt. Explicit replayable
+    streams open a fresh source through their factory on every attempt.
 
     A generator, file object or other one-shot iterable does not: httpx drains it
     on the first attempt, so a replay sends a short body while the original
@@ -352,7 +355,7 @@ def _is_replayable(content: bytes | Iterable[bytes] | AsyncIterable[bytes] | Non
     iterating either of those yields ``int``, so it rejects them on the first
     attempt regardless of what this returns.
     """
-    return content is None or isinstance(content, (bytes, str, list, tuple))
+    return content is None or isinstance(content, (bytes, str, list, tuple, ReplayableStream, AsyncReplayableStream))
 
 
 def _should_retry(

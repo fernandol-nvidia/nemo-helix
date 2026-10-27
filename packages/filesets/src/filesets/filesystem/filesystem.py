@@ -21,6 +21,7 @@ from fsspec.callbacks import DEFAULT_CALLBACK, Callback
 from fsspec.implementations.local import LocalFileSystem, make_path_posix, trailing_sep
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 from fsspec.utils import other_paths
+from nemo_helix_plugin.client.types import AsyncReplayableStream, ReplayableStream
 from nemo_helix_plugin.files.client import AsyncFilesClient, FilesClient
 from nemo_helix_plugin.files.types import FilesetFileOutput, ListFilesQueryParams
 
@@ -594,6 +595,7 @@ class FilesetFileSystem(AbstractFileSystem):
         callback.set_size(file_size)
 
         def stream_file() -> Iterator[bytes]:
+            callback.absolute_update(0)
             with open(lpath, "rb") as f:
                 while chunk := f.read(self.blocksize):
                     callback.relative_update(len(chunk))
@@ -603,7 +605,7 @@ class FilesetFileSystem(AbstractFileSystem):
             workspace=workspace,
             name=fileset,
             path=file_path,
-            content=stream_file(),
+            content=ReplayableStream(stream_file),
         )
         self.invalidate_cache(self._parent(build_fileset_ref(rpath)))
 
@@ -1192,6 +1194,7 @@ class AsyncFilesetFileSystem(AsyncFileSystem):
 
         # Create async generator that streams file content with progress
         async def stream_file() -> AsyncIterator[bytes]:
+            callback.absolute_update(0)
             async with await anyio.open_file(lpath, "rb") as f:
                 while chunk := await f.read(self.blocksize):
                     callback.relative_update(len(chunk))
@@ -1201,7 +1204,7 @@ class AsyncFilesetFileSystem(AsyncFileSystem):
             workspace=workspace,
             name=fileset,
             path=file_path,
-            content=stream_file(),
+            content=AsyncReplayableStream(stream_file),
         )
         # Invalidate parent directory's cache since file info is stored there
         self.invalidate_cache(self._parent(build_fileset_ref(rpath)))

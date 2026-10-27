@@ -9,7 +9,7 @@ strategies, and client-side option definitions used across the client package.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterable, Iterable
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Iterator
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, ClassVar, Final, Generic, ParamSpec, Protocol, TypeVar
@@ -31,6 +31,26 @@ class BinaryContent:
         @put("/files/{path}")
         def UploadEndpoint(content: bytes, *, path: str) -> FileResponse: ...
     """
+
+
+@dataclass(frozen=True)
+class ReplayableStream:
+    """A streaming body whose factory opens a fresh source for every attempt."""
+
+    factory: Callable[[], Iterator[bytes]]
+
+    def __iter__(self) -> Iterator[bytes]:
+        return self.factory()
+
+
+@dataclass(frozen=True)
+class AsyncReplayableStream:
+    """An async streaming body whose factory opens a fresh source for every attempt."""
+
+    factory: Callable[[], AsyncIterator[bytes]]
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self.factory()
 
 
 class Stream(Generic[ModelT]):
@@ -307,7 +327,8 @@ class RetryPolicy:
         mid-body failure (and any retryable status code, which by
         definition arrives after the body) is raised to the caller
         instead.  Retry those where the body can be rebuilt from its
-        source.
+        source. Use ``ReplayableStream`` or ``AsyncReplayableStream`` with
+        a factory that opens a fresh source to use this policy for streaming uploads.
 
     Usage::
 
