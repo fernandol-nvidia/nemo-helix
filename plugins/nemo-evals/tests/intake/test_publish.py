@@ -10,6 +10,7 @@ import math
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 from nemo_evals.intake.publish import PublishError, _token_final_metrics, publish_to_intake
@@ -739,3 +740,111 @@ async def test_a_partly_rejected_otlp_batch_fails_the_trial_instead_of_scoring_i
         )
 
     assert intake.evaluator_result_requests == [], "scores must not attach to a trace Intake only partly stored"
+
+
+@pytest.mark.parametrize("reject_second_batch", [False, True])
+async def test_a_large_trace_checks_each_batch_before_publishing_scores(monkeypatch, reject_second_batch) -> None:
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+
+    children = [
+        {"traceId": _OTLP_TRACE_ID, "spanId": f"{index:016x}", "parentSpanId": _OTLP_SPAN_ID, "name": "x" * 700}
+        for index in range(1, 4)
+    ]
+    intake = InMemoryIntakeService()
+    client = intake.client()
+    create = client.create_otlp_traces
+
+    async def ingest(**kwargs):
+        if reject_second_batch and len(intake.otlp_requests) == 1:
+            intake.otlp_errors = ["rejected second batch"]
+        return await create(**kwargs)
+
+    monkeypatch.setattr(client, "create_otlp_traces", ingest)
+    result = _result(
+        [_otlp_trial(extra_spans=children)], [_score("t-1", "accuracy", [MetricOutput(name="score", value=1)])]
+    )
+    if reject_second_batch:
+        with pytest.raises(PublishError, match="rejected second batch"):
+            await publish_to_intake(result, client=client, experiment_id="exp-1", max_otlp_request_bytes=1024)
+        assert len(intake.otlp_requests) == 2
+        assert intake.evaluator_result_requests == []
+    else:
+        report = await publish_to_intake(result, client=client, experiment_id="exp-1", max_otlp_request_bytes=1024)
+        assert len(intake.otlp_requests) > 1
+        assert report.published_trials[0].span_id == _OTLP_SPAN_ID
+        assert len(intake.evaluator_result_requests) == 1
+        assert all(len(cast(bytes, call["body"])) <= 1024 for call in intake.otlp_requests)
+        spans = [
+            span
+            for call in intake.otlp_requests
+            for resource in ExportTraceServiceRequest.FromString(call["body"]).resource_spans
+            for scope in resource.scope_spans
+            for span in scope.spans
+        ]
+        assert {span.span_id.hex() for span in spans} == {_OTLP_SPAN_ID, *(child["spanId"] for child in children)}
+
+
+async def test_an_oversized_span_fails_before_any_trace_or_score_is_sent() -> None:
+    child = {"traceId": _OTLP_TRACE_ID, "spanId": "0000000000000001", "parentSpanId": _OTLP_SPAN_ID, "name": "x" * 2000}
+    intake = InMemoryIntakeService()
+    result = _result(
+        [_otlp_trial(extra_spans=[child])], [_score("t-1", "accuracy", [MetricOutput(name="score", value=1)])]
+    )
+    with pytest.raises(PublishError, match="One OTLP span exceeds"):
+        await publish_to_intake(result, client=intake.client(), experiment_id="exp-1", max_otlp_request_bytes=1024)
+    assert intake.otlp_requests == []
+    assert intake.evaluator_result_requests == []
+
+
+@pytest.mark.parametrize("budget", [0, -1])
+async def test_invalid_otlp_budget_fails_before_network_calls(monkeypatch, budget) -> None:
+    from unittest.mock import AsyncMock
+
+    intake = InMemoryIntakeService()
+    client = intake.client()
+    get_evaluation = AsyncMock()
+    monkeypatch.setattr(client, "get_evaluation", get_evaluation)
+    with pytest.raises(ValueError, match="max_otlp_request_bytes must be positive"):
+        await publish_to_intake(_result([], []), client=client, experiment_id="exp-1", max_otlp_request_bytes=budget)
+    get_evaluation.assert_not_called()
+
+
+async def test_a_larger_budget_accepts_a_span_above_the_default() -> None:
+    from nemo_evals.intake.mapping import MAX_OTLP_REQUEST_BYTES
+
+    budget = 2 * MAX_OTLP_REQUEST_BYTES
+    child = {
+        "traceId": _OTLP_TRACE_ID,
+        "spanId": "0000000000000001",
+        "parentSpanId": _OTLP_SPAN_ID,
+        "name": "x" * (MAX_OTLP_REQUEST_BYTES + 1024),
+    }
+    intake = InMemoryIntakeService()
+    report = await publish_to_intake(
+        _result([_otlp_trial(extra_spans=[child])], []),
+        client=intake.client(),
+        experiment_id="exp-1",
+        max_otlp_request_bytes=budget,
+    )
+    assert len(report.published_trials) == 1
+    sizes = [len(cast(bytes, call["body"])) for call in intake.otlp_requests]
+    assert MAX_OTLP_REQUEST_BYTES < max(sizes) <= budget
+
+
+async def test_the_default_budget_splits_a_large_trace() -> None:
+    children = [
+        {
+            "traceId": _OTLP_TRACE_ID,
+            "spanId": f"{index:016x}",
+            "parentSpanId": _OTLP_SPAN_ID,
+            "name": "x" * (2 * 1024 * 1024),
+        }
+        for index in range(1, 4)
+    ]
+    intake = InMemoryIntakeService()
+    report = await publish_to_intake(
+        _result([_otlp_trial(extra_spans=children)], []), client=intake.client(), experiment_id="exp-1"
+    )
+    assert len(report.published_trials) == 1
+    assert len(intake.otlp_requests) > 1
+    assert all(len(cast(bytes, call["body"])) <= 4 * 1024 * 1024 for call in intake.otlp_requests)

@@ -6750,6 +6750,13 @@ components:
             the agent's own trajectory records (a Harbor agent's, such as codex's),
             else 'unknown'.
           default: unknown
+        max_otlp_request_bytes:
+          type: integer
+          exclusiveMinimum: 0.0
+          title: Max Otlp Request Bytes
+          description: Maximum serialized OTLP request size in bytes, including its
+            envelope. Configure within the destination Intake and proxy body limits.
+          default: 4194304
         required:
           type: boolean
           title: Required
@@ -8391,6 +8398,13 @@ components:
             the agent's own trajectory records (a Harbor agent's, such as codex's),
             else 'unknown'.
           default: unknown
+        max_otlp_request_bytes:
+          type: integer
+          exclusiveMinimum: 0.0
+          title: Max Otlp Request Bytes
+          description: Maximum serialized OTLP request size in bytes, including its
+            envelope. Configure within the destination Intake and proxy body limits.
+          default: 4194304
         required:
           type: boolean
           title: Required

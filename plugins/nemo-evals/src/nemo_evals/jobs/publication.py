@@ -172,6 +172,7 @@ async def _publish(
         workspace=workspace,
         agent_name=agent_name,
         agent_version=spec.agent_version,
+        max_otlp_request_bytes=spec.max_otlp_request_bytes,
         model_name=model_name,
     )
     publish_duration_sec = time.monotonic() - publish_started

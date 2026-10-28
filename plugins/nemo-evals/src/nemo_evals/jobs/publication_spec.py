@@ -10,7 +10,7 @@ dataset: which column identifies a test case.
 
 from __future__ import annotations
 
-from nemo_evals.intake.mapping import DEFAULT_AGENT_VERSION
+from nemo_evals.intake.mapping import DEFAULT_AGENT_VERSION, MAX_OTLP_REQUEST_BYTES
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -47,6 +47,12 @@ class IntakePublicationSpec(BaseModel):
         description="Agent version recorded on each published trajectory. Neither a Model nor an "
         "Agent carries a version, so this defaults to the version the agent's own trajectory records "
         "(a Harbor agent's, such as codex's), else 'unknown'.",
+    )
+    max_otlp_request_bytes: int = Field(
+        default=MAX_OTLP_REQUEST_BYTES,
+        gt=0,
+        description="Maximum serialized OTLP request size in bytes, including its envelope. "
+        "Configure within the destination Intake and proxy body limits.",
     )
     required: bool = Field(
         default=True,

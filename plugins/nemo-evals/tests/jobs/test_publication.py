@@ -774,3 +774,34 @@ def test_row_agent_target_derives_its_name() -> None:
         publication=RowPublicationSpec(intake=RowIntakePublicationSpec(evaluation_id="eval-1")),
     )
     assert target_agent_identity(spec.target) == ("my-agent", None)
+
+
+@pytest.mark.parametrize("spec_type", [IntakePublicationSpec, RowIntakePublicationSpec])
+def test_otlp_budget_defaults_and_validation(spec_type) -> None:
+    from nemo_evals.intake.mapping import MAX_OTLP_REQUEST_BYTES
+
+    assert spec_type(evaluation_id="eval-1").max_otlp_request_bytes == MAX_OTLP_REQUEST_BYTES
+    for budget in [0, -1]:
+        with pytest.raises(ValidationError):
+            spec_type(evaluation_id="eval-1", max_otlp_request_bytes=budget)
+
+
+@pytest.mark.parametrize("spec_type", [IntakePublicationSpec, RowIntakePublicationSpec])
+async def test_job_publication_forwards_the_otlp_budget(monkeypatch, intake, spec_type) -> None:
+    from unittest.mock import AsyncMock
+
+    from nemo_evals.intake.publish import PublishReport
+    from nemo_evals.jobs import publication
+
+    native = AsyncMock(return_value=PublishReport(experiment_id="eval-1", workspace="default", run_id="run-1"))
+    monkeypatch.setattr(publication, "publish_to_intake", native)
+    await publication._publish(
+        _result(),
+        intake=intake.client(),
+        spec=spec_type(evaluation_id="eval-1", max_otlp_request_bytes=1024),
+        workspace="default",
+        agent_name="a",
+        model_name=None,
+        record_durations=False,
+    )
+    assert native.call_args.kwargs["max_otlp_request_bytes"] == 1024

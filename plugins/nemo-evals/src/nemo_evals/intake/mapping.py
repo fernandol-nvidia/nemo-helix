@@ -71,6 +71,9 @@ ATIF_SCHEMA_VERSION: Literal["ATIF-v1.7"] = "ATIF-v1.7"
 #: Agent has a version field today, and ATIF requires one (design doc §3.9 #6).
 DEFAULT_AGENT_VERSION = "unknown"
 
+# Default publication budget, including the protobuf envelope; the receiver limit is deployment-owned.
+MAX_OTLP_REQUEST_BYTES = 4 * 1024 * 1024
+
 # Span attribute keys Intake reads identity back from; see its span attribute catalog. The
 # session id has two accepted keys and this is the one that wins.
 _SESSION_ID_ATTRIBUTE = "gen_ai.conversation.id"
@@ -453,3 +456,43 @@ def _coerce_metric_value(value: object) -> tuple[EvaluatorResultDataType, float 
     if isinstance(unwrapped, (int, float)):
         return "NUMERIC", float(unwrapped), None
     return "TEXT", None, str(unwrapped)
+
+
+def bounded_otlp_requests(payload: bytes, *, max_bytes: int = MAX_OTLP_REQUEST_BYTES) -> list[bytes]:
+    """Split an oversized request in span order; reject an oversized span before any send."""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+
+    # No split is needed when the entire request fits within the byte budget.
+    if len(payload) <= max_bytes:
+        return [payload]
+
+    source = ExportTraceServiceRequest.FromString(payload)
+    requests = []
+    batch = ExportTraceServiceRequest()
+    batch_bytes = 0
+
+    for resource in source.resource_spans:
+        for scope in resource.scope_spans:
+            for span in scope.spans:
+                entry = ExportTraceServiceRequest()
+                target = entry.resource_spans.add(resource=resource.resource, schema_url=resource.schema_url)
+                target.scope_spans.add(scope=scope.scope, schema_url=scope.schema_url).spans.append(span)
+
+                entry_bytes = entry.ByteSize()
+                if entry_bytes > max_bytes:
+                    raise ValueError("One OTLP span exceeds the request byte limit")
+
+                if batch_bytes + entry_bytes > max_bytes:
+                    requests.append(batch.SerializeToString())
+                    batch.Clear()
+                    batch_bytes = 0
+
+                batch.resource_spans.extend(entry.resource_spans)
+                # Each entry adds an independent top-level repeated field, so wire sizes add exactly.
+                batch_bytes += entry_bytes
+
+    if batch.resource_spans:
+        requests.append(batch.SerializeToString())
+
+    return requests

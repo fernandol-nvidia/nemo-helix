@@ -146,6 +146,7 @@ async def publish_to_intake(
     agent_version: str = mapping.DEFAULT_AGENT_VERSION,
     model_name: str | None = None,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    max_otlp_request_bytes: int = mapping.MAX_OTLP_REQUEST_BYTES,
 ) -> PublishReport:
     """Publish a completed ``AgentEvalResult`` to Intake under an existing Experiment.
 
@@ -175,8 +176,11 @@ async def publish_to_intake(
 
     Agent identity (``agent_name``/``agent_version``/``model_name``) is taken as
     arguments because it lives on the run *target*, which ``AgentEvalResult`` does
-    not carry (design §3.9 #6).
+    not carry (design §3.9 #6). ``max_otlp_request_bytes`` bounds each serialized OTLP request,
+    including its envelope. Configure it within the destination's Intake and proxy body limits.
     """
+    if max_otlp_request_bytes <= 0:
+        raise ValueError("max_otlp_request_bytes must be positive")
     validated_trials = [AgentEvalTrial.model_validate(trial) for trial in result.trials]
     intake = client
     resolved_workspace = intake.require_workspace(workspace)
@@ -224,15 +228,16 @@ async def publish_to_intake(
         if otlp is None:
             return None
         payload, span_id = otlp
-        response = await intake.create_otlp_traces(content=payload, workspace=resolved_workspace)
-        ingest_response = response.data()
-        # OTLP ingest answers 200 with a per-span error list, so a partly-stored trace is
-        # invisible unless the body is read — including the case where the span the scores
-        # are about to reference is the one that was dropped.
-        if ingest_response.errors:
-            raise PublishError(
-                f"Intake rejected {len(ingest_response.errors)} span(s) of trial {trial.id!r}: {ingest_response.errors}"
-            )
+        for request in mapping.bounded_otlp_requests(payload, max_bytes=max_otlp_request_bytes):
+            response = await intake.create_otlp_traces(content=request, workspace=resolved_workspace)
+            ingest_response = response.data()
+            # OTLP ingest answers 200 with a per-span error list, so a partly-stored trace is
+            # invisible unless the body is read — including the case where the span the scores
+            # are about to reference is the one that was dropped.
+            if ingest_response.errors:
+                raise PublishError(
+                    f"Intake rejected {len(ingest_response.errors)} span(s) of trial {trial.id!r}: {ingest_response.errors}"
+                )
         return span_id
 
     async def _publish_atif(trial: AgentEvalTrial, *, measurements: TrialMeasurements, session_id: str) -> str:

@@ -492,6 +492,23 @@ You typically do not create Evaluations manually. Common producers include:
 - **Direct API**: create the Experiment and Evaluations, then ingest their sessions, for a custom
   evaluation pipeline.
 
+Agent and dataset evaluation jobs bound each OTLP publication request by
+`publication.intake.max_otlp_request_bytes` (default: 4 MiB, or `4194304` bytes).
+For a Helix-managed job, set it in the job spec:
+
+```yaml
+publication:
+  intake:
+    evaluation_id: my-evaluation
+    max_otlp_request_bytes: 2097152  # 2 MiB
+```
+
+The positive byte budget includes the protobuf envelope and must fit within the destination
+Intake and proxy body limits; it does not change those limits. The standalone
+`publish_to_intake(..., max_otlp_request_bytes=...)` API uses the same setting and default.
+An individual span that exceeds the budget fails publication; retained results can be
+republished with a larger budget when the destination permits it.
+
 ### Do It with an Agent
 
 If you are working with a coding agent, the `nemo-experiments-upload` skill automates this whole path:
