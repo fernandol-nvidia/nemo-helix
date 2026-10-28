@@ -113,6 +113,7 @@ async def test_publishes_trajectory_and_scores() -> None:
 
     assert len(intake.atif_requests) == 1
     assert intake.atif_requests[0]["session_id"] == "run-1:t-1"
+    assert intake.atif_requests[0]["agent"]["name"] == "agent"
     assert intake.atif_requests[0]["evaluation_context"] == {
         "evaluation_name": "exp-1",
         "test_case_name": "task-1",
@@ -497,6 +498,69 @@ async def test_the_published_otlp_payload_carries_the_stamped_identity() -> None
     # The producer's ids survive the hex/base64 round trip, or scores attach to nothing.
     assert span.span_id.hex() == _OTLP_SPAN_ID
     assert span.trace_id.hex() == _OTLP_TRACE_ID
+
+
+@pytest.mark.parametrize("on_resource", [False, True])
+@pytest.mark.parametrize(
+    ("agent_name", "agent_version", "model_name"),
+    [
+        ("caller", "2.0", "caller-model"),
+        ("agent", "unknown", None),
+        (None, "2.0", None),
+        (None, "unknown", ""),
+        (None, "unknown", None),
+    ],
+)
+async def test_otlp_identity_overrides_preserve_producer_evidence(on_resource, agent_name, agent_version, model_name):
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+
+    producer = {
+        "gen_ai.agent.name": "producer",
+        "gen_ai.agent.version": "1.0",
+        "gen_ai.request.model": "producer-model",
+        "input.value": "recorded prompt",
+        "output.value": "",
+    }
+    attributes = [{"key": key, "value": {"stringValue": value}} for key, value in producer.items()]
+    child = {
+        "traceId": _OTLP_TRACE_ID,
+        "spanId": "aabbccddeeff0011",
+        "parentSpanId": _OTLP_SPAN_ID,
+        "name": "child",
+        "attributes": attributes,
+    }
+    trial = _otlp_trial(extra_spans=[child])
+    resource = trial.evidence.descriptors["trace"].data["resourceSpans"][0]
+    target = resource.setdefault("resource", {}) if on_resource else resource["scopeSpans"][0]["spans"][0]
+    target["attributes"] = attributes
+    result = _result([trial], [])
+    handle = await trial.evidence.trace(format="otlp")
+    source = await handle.resource_spans()
+    original = ExportTraceServiceRequest(resource_spans=source).SerializeToString()
+    expected = producer.copy()
+    if agent_name is not None:
+        expected["gen_ai.agent.name"] = agent_name
+    if agent_version != "unknown":
+        expected["gen_ai.agent.version"] = agent_version
+    if model_name is not None:
+        expected["gen_ai.request.model"] = model_name
+
+    for options, expected in [
+        ({"agent_name": agent_name, "agent_version": agent_version, "model_name": model_name}, expected),
+        ({}, producer),
+    ]:
+        intake = InMemoryIntakeService()
+        await publish_to_intake(result, client=intake.client(), experiment_id="exp-1", **options)
+
+        resource = ExportTraceServiceRequest.FromString(intake.otlp_requests[0]["body"]).resource_spans[0]
+        root, child_span = resource.scope_spans[0].spans
+        for span, expected_values in [(root, expected), (child_span, producer)]:
+            actual = {
+                attribute.key: attribute.value.string_value
+                for attribute in [*resource.resource.attributes, *span.attributes]
+            }
+            assert {key: actual[key] for key in producer} == expected_values
+        assert ExportTraceServiceRequest(resource_spans=source).SerializeToString() == original
 
 
 async def test_a_trial_without_an_otlp_trace_still_publishes_atif() -> None:

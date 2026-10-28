@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -170,6 +171,9 @@ async def otlp_ingest_for_trial(
     evaluation_name: str,
     measurements: TrialMeasurements,
     started_at: datetime,
+    agent_name: str | None = None,
+    agent_version: str = DEFAULT_AGENT_VERSION,
+    model_name: str | None = None,
 ) -> tuple[bytes, str] | None:
     """Return the trial's OTLP payload stamped with evaluation identity, and its root span id.
 
@@ -207,6 +211,8 @@ async def otlp_ingest_for_trial(
         )
         return None
 
+    # Trace handles cache these messages; each publication needs its own copy.
+    resource_spans = deepcopy(resource_spans)
     set_span_attributes(
         resource_spans,
         {
@@ -215,7 +221,14 @@ async def otlp_ingest_for_trial(
             _TEST_CASE_NAME_ATTRIBUTE: trial.task_id,
         },
     )
-    set_root_span_attributes(resource_spans, _trial_totals(trial, measurements))
+    root_attributes = _trial_totals(trial, measurements)
+    if agent_name is not None:
+        root_attributes["gen_ai.agent.name"] = agent_name
+    if agent_version != DEFAULT_AGENT_VERSION:
+        root_attributes["gen_ai.agent.version"] = agent_version
+    if model_name is not None:
+        root_attributes["gen_ai.request.model"] = model_name
+    set_root_span_attributes(resource_spans, root_attributes)
     if trial.error is not None:
         set_root_span_error(resource_spans, message=trial.error.message)
     fill_missing_start_times(resource_spans, start_time_unix_nano=int(started_at.timestamp() * 1_000_000_000))

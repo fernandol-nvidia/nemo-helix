@@ -142,7 +142,7 @@ async def publish_to_intake(
     client: AsyncIntakeClient,
     experiment_id: str,
     workspace: str | None = None,
-    agent_name: str = "agent",
+    agent_name: str | None = None,
     agent_version: str = mapping.DEFAULT_AGENT_VERSION,
     model_name: str | None = None,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
@@ -175,7 +175,8 @@ async def publish_to_intake(
 
     Agent identity (``agent_name``/``agent_version``/``model_name``) is taken as
     arguments because it lives on the run *target*, which ``AgentEvalResult`` does
-    not carry (design §3.9 #6).
+    not carry (design §3.9 #6). Omitted names and the default "unknown" version
+    preserve OTLP producer attributes; ATIF defaults to agent name "agent".
     """
     validated_trials = [AgentEvalTrial.model_validate(trial) for trial in result.trials]
     intake = client
@@ -220,6 +221,9 @@ async def publish_to_intake(
             evaluation_name=experiment_id,
             measurements=measurements,
             started_at=started_at,
+            agent_name=agent_name,
+            agent_version=agent_version,
+            model_name=model_name,
         )
         if otlp is None:
             return None
@@ -248,7 +252,7 @@ async def publish_to_intake(
                 trial,
                 run_id=result.run_id,
                 evaluation_name=experiment_id,
-                agent_name=agent_name,
+                agent_name=agent_name if agent_name is not None else "agent",
                 started_at=started_at,
                 agent_version=agent_version,
                 model_name=model_name,
